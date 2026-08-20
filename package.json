@@ -1,0 +1,11 @@
+{
+  "name": "codex-cost-meter-marketplace",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Public Git marketplace for the Codex Cost Meter plugin.",
+  "license": "MIT",
+  "scripts": {
+    "check": "node --check plugins/codex-cost-meter/scripts/turn-cost.js",
+    "test": "node --test"
+  }
+}

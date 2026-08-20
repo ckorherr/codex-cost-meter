@@ -1,0 +1,20 @@
+{
+  "name": "cost-meter",
+  "interface": {
+    "displayName": "Codex Cost Meter"
+  },
+  "plugins": [
+    {
+      "name": "codex-cost-meter",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-cost-meter"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

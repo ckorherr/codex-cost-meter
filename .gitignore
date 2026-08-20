@@ -1,0 +1,10 @@
+.DS_Store
+Thumbs.db
+node_modules/
+coverage/
+*.log
+*.jsonl
+.codex/
+usage/
+hook-cache/
+plugin-data/

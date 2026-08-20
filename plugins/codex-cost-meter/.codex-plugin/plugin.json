@@ -1,0 +1,31 @@
+{
+  "name": "codex-cost-meter",
+  "version": "0.1.0",
+  "description": "Display local Codex token usage and estimated EUR costs after every root turn.",
+  "author": {
+    "name": "Codex Cost Meter contributors"
+  },
+  "homepage": "https://github.com/ckorherr/codex-cost-meter",
+  "repository": "https://github.com/ckorherr/codex-cost-meter",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "cost",
+    "tokens",
+    "usage",
+    "hooks"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Cost Meter",
+    "shortDescription": "Local token and estimated cost totals",
+    "longDescription": "Shows per-turn, session, daily, and monthly token usage and estimated EUR cost, including transitive subagents and fork-aware accounting.",
+    "developerName": "Codex Cost Meter contributors",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Usage insights",
+      "Local-only accounting"
+    ],
+    "defaultPrompt": "Explain the Codex Cost Meter totals and configuration."
+  }
+}
