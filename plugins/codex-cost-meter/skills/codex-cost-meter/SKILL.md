@@ -53,9 +53,14 @@ It reads local Codex rollout files to extract token counters and agent lineage.
 The source-of-truth ledger stores one aggregate record per completed root turn,
 including compact model and root-versus-subagent breakdowns. It does not store
 one record per tool call or persist prompt, response, or tool-output text.
-Rebuildable caches contain only the accounting metadata needed to avoid
-reparsing unchanged rollout history. The Stop hook and localhost dashboard
-make no external requests. The in-chat Refresh button sends only a fixed
+Each UTC month uses one canonical
+`PLUGIN_DATA/usage/YYYY-MM/turns.jsonl` source file; legacy per-task JSONL
+files are ignored.
+At Stop, it reads only the current root turn and the subagents associated with
+that turn. Session, day, and month totals come from a compact, rebuildable
+ledger rollup rather than historical transcript traversal. Rebuildable caches
+contain only accounting metadata. The Stop hook and localhost dashboard make
+no external requests. The in-chat Refresh button sends only a fixed
 user-triggered Codex prompt and never sends ledger values.
 
 ## Configure
@@ -92,11 +97,16 @@ Preserve these invariants:
 
 - emit display-only results through `systemMessage`, never `additionalContext`;
 - keep subagent `Stop` events silent;
-- never display partial numeric totals when agent traversal is incomplete;
+- never present a partial numeric total as exact; label trustworthy known
+  usage as a lower bound with its pending-turn count;
 - keep fork/copy accounting branch-local;
 - keep ledger writes idempotent by `(root_thread_id, turn_id)`;
-- record a metadata-only gap when a post-install root turn cannot be traversed
-  or priced exactly, so later aggregates remain unavailable rather than partial;
+- keep schema-2 ledger entries in the canonical monthly `turns.jsonl` file so
+  cold rollup rebuilds never open one source file per session;
+- record an unresolved gap when a post-install root turn cannot be traversed
+  or priced exactly, preserving trustworthy known usage when available;
+- keep the Stop hot path independent of full transcript-history and full-ledger
+  scans, including when every derived cache is absent;
 - never backfill turns that completed before the plugin began recording;
 - keep all settings, ledgers, and caches under `PLUGIN_DATA`;
 - never put prompts, responses, tool output, or full project paths in the
@@ -114,6 +124,8 @@ Confirm that:
 - a new Codex task was started after installation or update;
 - the active model has an entry in `PRICE_PER_MILLION`.
 
-The first turn in a very large agent history can show a cache-warming message.
-Later turns can be measured after the cache warms, but the gap from that first
-turn keeps affected current-period aggregate totals unavailable.
+A missing hook cache must not cause a history-warming message. The hook should
+target only the current root turn and its descendants, then rebuild session,
+day, and month totals from the compact ledger rollup. If current subagent data
+has not finished flushing, it may show a clearly marked lower bound and pending
+count; a later exact record reconciles that gap idempotently.

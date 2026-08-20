@@ -8,15 +8,16 @@ const { performance } = require('node:perf_hooks');
 const { spawn } = require('node:child_process');
 const {
   readSessionMetadata,
-  buildSessionFileIndex,
-  findChildMetadata,
+  findChildSessionMetadata,
 } = require('../lib/session-index');
 const {
   appendLedgerGap,
   appendLedgerRecord,
-  buildSnapshot,
+  budgetState,
+  buildHookRollup,
   crossedBudgetThresholds,
   loadSettings,
+  projectMonthEndNanos,
   resolveDataRoot,
 } = require('../lib/runtime-data');
 
@@ -24,6 +25,8 @@ const PRICING_AS_OF = '2026-08-20';
 const EUR_PER_USD = 0.9;
 const CACHE_VERSION = 5;
 const ANALYSIS_BUDGET_MS = 7_500;
+const INITIAL_COLD_WINDOW_BYTES = 512 * 1024;
+const MAX_COLD_WINDOW_BYTES = 64 * 1024 * 1024;
 const PRICE_PER_MILLION = {
   'gpt-5.6-sol': {
     input: 5.0,
@@ -457,7 +460,7 @@ function expandUsage(values) {
   );
 }
 
-function serializeParsedRollout(parsed, stat) {
+function serializeParsedRollout(parsed, stat, windowStartOffset = 0) {
   return {
     version: CACHE_VERSION,
     sourceKey: rolloutSourceKey(parsed.filePath),
@@ -465,6 +468,7 @@ function serializeParsedRollout(parsed, stat) {
     sourceSize: stat.size,
     mtimeMs: Math.trunc(stat.mtimeMs),
     offset: parsed.offset,
+    windowStartOffset,
     parsed: {
       firstMetadata: parsed.firstMetadata,
       taskStarts: parsed.taskStarts.map((task) => [
@@ -548,11 +552,101 @@ function hydrateParsedRollout(filePath, value) {
   };
 }
 
-function parseRolloutCached(filePath, threadId, cacheDirectory) {
+function applySessionMetadata(parsed, metadata) {
+  if (!metadata || parsed.firstMetadata) {
+    return;
+  }
+  parsed.firstMetadata = {
+    threadId: metadata.threadId,
+    sessionId: metadata.sessionId,
+    forkedFromId: metadata.forkedFromId,
+    parentThreadId: metadata.parentThreadId,
+    isSubagent: metadata.isSubagent,
+    startedMs: metadata.startedMs,
+  };
+}
+
+function acceptsParsedWindow(accept, parsed, windowStartOffset) {
+  return accept(parsed, {
+    truncated: windowStartOffset > 0,
+    windowStartOffset,
+  });
+}
+
+function parseColdRolloutWindow(filePath, stat, options) {
+  const maximumBytes = Math.max(
+    INITIAL_COLD_WINDOW_BYTES,
+    Math.min(
+      stat.size,
+      Number.isSafeInteger(options.maxColdBytes)
+        ? options.maxColdBytes
+        : MAX_COLD_WINDOW_BYTES,
+    ),
+  );
+  let windowBytes = Math.min(stat.size, INITIAL_COLD_WINDOW_BYTES);
+  let latest = null;
+
+  while (true) {
+    const requestedStart = Math.max(0, stat.size - windowBytes);
+    let bytes = readRolloutTail(filePath, requestedStart, stat.size);
+    let windowStartOffset = requestedStart;
+    if (requestedStart > 0) {
+      const firstNewline = bytes.indexOf(0x0a);
+      if (firstNewline < 0) {
+        if (
+          windowBytes >= maximumBytes ||
+          performance.now() >= options.deadlineMs
+        ) {
+          const parsed = emptyParsedRollout(filePath);
+          applySessionMetadata(parsed, options.metadata);
+          parsed.offset = stat.size;
+          parsed.coldWindowLimited = true;
+          return { parsed, windowStartOffset: stat.size };
+        }
+        windowBytes = Math.min(maximumBytes, windowBytes * 2);
+        continue;
+      }
+      windowStartOffset += firstNewline + 1;
+      bytes = bytes.subarray(firstNewline + 1);
+    }
+
+    const parsed = emptyParsedRollout(filePath);
+    applySessionMetadata(parsed, options.metadata);
+    parsed.offset =
+      windowStartOffset + appendRolloutBytes(parsed, bytes);
+    latest = { parsed, windowStartOffset };
+    if (acceptsParsedWindow(
+      options.accept,
+      parsed,
+      windowStartOffset,
+    )) {
+      return latest;
+    }
+    if (
+      requestedStart === 0 ||
+      windowBytes >= maximumBytes ||
+      performance.now() >= options.deadlineMs
+    ) {
+      parsed.coldWindowLimited = requestedStart > 0;
+      return latest;
+    }
+    windowBytes = Math.min(maximumBytes, windowBytes * 2);
+  }
+}
+
+function parseRolloutCached(
+  filePath,
+  threadId,
+  cacheDirectory,
+  options = {},
+) {
   const stat = rolloutStat(filePath);
   const cachePath = cachePathFor(cacheDirectory, threadId);
+  const accept =
+    typeof options.accept === 'function' ? options.accept : null;
   let parsed = null;
   let cached = null;
+  let windowStartOffset = 0;
 
   try {
     cached = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
@@ -564,7 +658,14 @@ function parseRolloutCached(filePath, threadId, cacheDirectory) {
     if (unchanged) {
       parsed = hydrateParsedRollout(filePath, cached.parsed ?? {});
       parsed.offset = Number(cached.offset ?? stat.size);
-      return parsed;
+      windowStartOffset = Number(cached.windowStartOffset ?? 0);
+      if (
+        !accept ||
+        acceptsParsedWindow(accept, parsed, windowStartOffset)
+      ) {
+        return parsed;
+      }
+      parsed = null;
     }
     const appendOnly =
       sameSource &&
@@ -576,23 +677,49 @@ function parseRolloutCached(filePath, threadId, cacheDirectory) {
     if (appendOnly) {
       parsed = hydrateParsedRollout(filePath, cached.parsed ?? {});
       parsed.offset = cached.offset;
+      windowStartOffset = Number(cached.windowStartOffset ?? 0);
     }
   } catch {
     // A missing, stale, or partial cache is rebuilt below.
   }
 
-  if (!parsed) {
-    parsed = emptyParsedRollout(filePath);
+  if (parsed) {
+    const bytes = readRolloutTail(filePath, parsed.offset, stat.size);
+    parsed.offset += appendRolloutBytes(parsed, bytes);
+    if (
+      accept &&
+      !acceptsParsedWindow(accept, parsed, windowStartOffset)
+    ) {
+      parsed = null;
+    }
   }
-  const bytes = readRolloutTail(filePath, parsed.offset, stat.size);
-  parsed.offset += appendRolloutBytes(parsed, bytes);
+
+  if (!parsed && accept) {
+    const cold = parseColdRolloutWindow(filePath, stat, {
+      ...options,
+      accept,
+      deadlineMs:
+        Number.isFinite(options.deadlineMs)
+          ? options.deadlineMs
+          : Number.POSITIVE_INFINITY,
+    });
+    parsed = cold.parsed;
+    windowStartOffset = cold.windowStartOffset;
+  } else if (!parsed) {
+    parsed = emptyParsedRollout(filePath);
+    const bytes = readRolloutTail(filePath, 0, stat.size);
+    parsed.offset = appendRolloutBytes(parsed, bytes);
+    windowStartOffset = 0;
+  }
 
   try {
     fs.mkdirSync(cacheDirectory, { recursive: true });
     const temporaryPath = `${cachePath}.${process.pid}.tmp`;
     fs.writeFileSync(
       temporaryPath,
-      JSON.stringify(serializeParsedRollout(parsed, stat)),
+      JSON.stringify(
+        serializeParsedRollout(parsed, stat, windowStartOffset),
+      ),
       { encoding: 'utf8', mode: 0o600 },
     );
     fs.renameSync(temporaryPath, cachePath);
@@ -645,6 +772,10 @@ function buildAccounting(parsed, ownedTaskStarts, branchIndex, defaultModel, war
   );
 
   const markers = [];
+  const accountingEndIndex = ownedTaskStarts.reduce(
+    (latest, task) => Math.max(latest, task.endIndex),
+    branchIndex,
+  );
   for (const task of ownedTaskStarts) {
     markers.push({ type: 'start', index: task.index, taskId: task.id });
     if (Number.isFinite(task.endIndex)) {
@@ -652,18 +783,37 @@ function buildAccounting(parsed, ownedTaskStarts, branchIndex, defaultModel, war
     }
   }
   for (const event of parsed.tokenEvents) {
-    if (event.index > branchIndex) {
+    if (
+      event.index > branchIndex &&
+      event.index <= accountingEndIndex
+    ) {
       markers.push({ type: 'token', index: event.index, event });
     }
   }
   for (const event of parsed.invalidTokenEvents) {
-    if (event.index > branchIndex) {
+    if (
+      event.index > branchIndex &&
+      event.index <= accountingEndIndex
+    ) {
       markers.push({ type: 'invalid-token', index: event.index, event });
     }
   }
   markers.sort((left, right) => left.index - right.index);
 
-  const baseline = tokenBefore(parsed, branchIndex)?.total ?? zeroUsage();
+  const precedingToken = tokenBefore(parsed, branchIndex);
+  const firstOwnedToken = parsed.tokenEvents.find(
+    (event) =>
+      event.index > branchIndex &&
+      event.index <= accountingEndIndex,
+  );
+  const baseline =
+    precedingToken?.total ??
+    (
+      firstOwnedToken &&
+      isMonotonic(firstOwnedToken.last, firstOwnedToken.total)
+        ? subtractUsage(firstOwnedToken.total, firstOwnedToken.last)
+        : firstOwnedToken?.last ?? zeroUsage()
+    );
   let previous = baseline;
   let activeTaskId = null;
   const segments = [];
@@ -771,74 +921,201 @@ function findActiveTask(accounting, eventIndex) {
   return match;
 }
 
-function selectChildBranch(parentParsed, childParsed, spawnActivity) {
-  const candidates = childParsed.taskStarts.filter(
-    (task) => !parentParsed.taskIds.has(task.id),
-  );
-  const pool = candidates.length > 0 ? candidates : childParsed.taskStarts;
-  if (pool.length === 0) {
-    return null;
-  }
-
-  return pool.reduce((best, candidate) => {
-    const distance = Math.abs(candidate.startedMs - spawnActivity.occurredAtMs);
-    if (!best || distance < best.distance) {
-      return { task: candidate, distance };
+function currentChildActivities(parentAccounting, rootTurnId) {
+  return parentAccounting.parsed.activities.filter((activity) => {
+    if (
+      activity.index <= parentAccounting.branchIndex ||
+      !['started', 'interacted'].includes(activity.kind)
+    ) {
+      return false;
     }
-    return best;
-  }, null)?.task;
+    return (
+      findActiveTask(parentAccounting, activity.index)?.rootTurnId ===
+      rootTurnId
+    );
+  });
 }
 
-function mapChildTasksToRoot(parentAccounting, childAccounting, childThreadId, warnings) {
+function groupActivitiesByChild(activities) {
+  const grouped = new Map();
+  for (const activity of activities) {
+    const childActivities = grouped.get(activity.childThreadId) ?? [];
+    childActivities.push(activity);
+    grouped.set(activity.childThreadId, childActivities);
+  }
+  return grouped;
+}
+
+function selectChildTasks(parentParsed, childParsed, activities) {
+  const candidates = childParsed.taskStarts
+    .filter((task) => !parentParsed.taskIds.has(task.id))
+    .sort((left, right) => left.index - right.index);
+  const orderedActivities = [...activities].sort(
+    (left, right) =>
+      left.occurredAtMs - right.occurredAtMs ||
+      left.index - right.index,
+  );
+  const selected = new Map();
+  const matches = [];
+  let complete = true;
+
+  function covers(task, activity) {
+    return (
+      task.startedMs <= activity.occurredAtMs + 10_000 &&
+      (
+        task.completedMs === null ||
+        activity.occurredAtMs <= task.completedMs
+      )
+    );
+  }
+
+  function startsNear(task, activity) {
+    return Math.abs(task.startedMs - activity.occurredAtMs) <= 10_000;
+  }
+
+  let cursor = -1;
+  let currentTask = null;
+  for (
+    let activityIndex = 0;
+    activityIndex < orderedActivities.length;
+    activityIndex += 1
+  ) {
+    const activity = orderedActivities[activityIndex];
+    const remainingActivities =
+      orderedActivities.length - activityIndex;
+    const nextCandidates = candidates
+      .map((task, index) => ({ task, index }))
+      .filter(
+        ({ task, index }) =>
+          index > cursor &&
+          covers(task, activity) &&
+          startsNear(task, activity),
+      );
+    let task = null;
+    let taskIndex = cursor;
+
+    if (!currentTask) {
+      const closest = nextCandidates.reduce((best, candidate) => {
+        const distance = Math.abs(
+          candidate.task.startedMs - activity.occurredAtMs,
+        );
+        return (
+          !best ||
+          distance < best.distance ||
+          (
+            distance === best.distance &&
+            candidate.index < best.index
+          )
+        )
+          ? { ...candidate, distance }
+          : best;
+      }, null);
+      task = closest?.task ?? null;
+      taskIndex = closest?.index ?? cursor;
+    } else if (
+      covers(currentTask, activity) &&
+      nextCandidates.length < remainingActivities
+    ) {
+      task = currentTask;
+    } else if (nextCandidates.length > 0) {
+      task = nextCandidates[0].task;
+      taskIndex = nextCandidates[0].index;
+    } else if (covers(currentTask, activity)) {
+      task = currentTask;
+    }
+
+    if (!task) {
+      complete = false;
+      continue;
+    }
+    cursor = taskIndex;
+    currentTask = task;
+    selected.set(task.id, task);
+    matches.push({ activity, task });
+  }
+
+  const selectedIndexes = [...selected.values()].map((task) =>
+    candidates.indexOf(task),
+  );
+  if (selectedIndexes.length > 0) {
+    const first = Math.min(...selectedIndexes);
+    const last = Math.max(...selectedIndexes);
+    for (let index = first; index <= last; index += 1) {
+      const task = candidates[index];
+      if (
+        !selected.has(task.id) &&
+        orderedActivities.some((activity) => covers(task, activity))
+      ) {
+        complete = false;
+      }
+    }
+  }
+  for (const task of selected.values()) {
+    if (
+      task.completed &&
+      matches.filter((match) => match.task.id === task.id).length > 1
+    ) {
+      complete = false;
+    }
+  }
+
+  return {
+    tasks: [...selected.values()].sort(
+      (left, right) => left.index - right.index,
+    ),
+    matches,
+    complete,
+  };
+}
+
+function reusesSelectedTask(selection) {
+  const matchedTaskIds = new Set();
+  for (const match of selection.matches) {
+    if (matchedTaskIds.has(match.task.id)) {
+      return true;
+    }
+    matchedTaskIds.add(match.task.id);
+  }
+  return false;
+}
+
+function mapChildTasksToRoot(
+  parentAccounting,
+  childAccounting,
+  childThreadId,
+  activityTaskMatches,
+  warnings,
+) {
   const ownedStarts = [...childAccounting.tasks.values()].sort(
     (left, right) => left.index - right.index,
   );
-  const activities = parentAccounting.parsed.activities.filter(
-    (activity) =>
-      activity.childThreadId === childThreadId &&
-      activity.index > parentAccounting.branchIndex &&
-      activity.kind !== 'interrupted',
-  );
-  const usedActivities = new Set();
   let exact = true;
 
-  for (let taskIndex = 0; taskIndex < ownedStarts.length; taskIndex += 1) {
-    const task = ownedStarts[taskIndex];
-    const preferredKind = taskIndex === 0 ? 'started' : 'interacted';
-    const preferred = activities.filter(
-      (activity, index) =>
-        activity.kind === preferredKind && !usedActivities.has(index),
+  for (const task of ownedStarts) {
+    const matches = activityTaskMatches.filter(
+      (match) => match.task.id === task.id,
     );
-    const fallback = activities.filter(
-      (_activity, index) => !usedActivities.has(index),
-    );
-    const pool = preferred.length > 0 ? preferred : fallback;
-
-    let best = null;
-    for (const activity of pool) {
-      const originalIndex = activities.indexOf(activity);
-      const distance = Math.abs(activity.occurredAtMs - task.startedMs);
-      if (!best || distance < best.distance) {
-        best = { activity, originalIndex, distance };
-      }
-    }
-
-    if (!best || best.distance > 10_000) {
+    if (matches.length === 0) {
       warnings.push(`Could not map subagent task ${task.id} to its parent turn.`);
       task.exact = false;
       exact = false;
       continue;
     }
 
-    usedActivities.add(best.originalIndex);
-    const parentTask = findActiveTask(parentAccounting, best.activity.index);
-    if (!parentTask?.rootTurnId) {
+    const rootTurnIds = new Set(
+      matches
+        .map((match) =>
+          findActiveTask(parentAccounting, match.activity.index)?.rootTurnId,
+        )
+        .filter(Boolean),
+    );
+    if (rootTurnIds.size !== 1) {
       warnings.push(`Could not resolve the root turn for subagent task ${task.id}.`);
       task.exact = false;
       exact = false;
       continue;
     }
-    task.rootTurnId = parentTask.rootTurnId;
+    task.rootTurnId = [...rootTurnIds][0];
   }
 
   for (let index = 0; index < ownedStarts.length; index += 1) {
@@ -1075,6 +1352,15 @@ function ledgerGapFor(result, reason, completedAtMs, writtenAtMs) {
     completed_at: new Date(completedAtMs).toISOString(),
     written_at: new Date(writtenAtMs).toISOString(),
     reason,
+    ...(result.turnPriced && hasUsage(result.turn.usage)
+      ? {
+          known_usage: result.turn.usage,
+          known_cost_usd_nanos: Math.round(
+            result.turn.cost * 1_000_000_000,
+          ),
+          known_cost_eur_nanos: eurosToNanos(result.turn.costEur),
+        }
+      : {}),
   };
 }
 
@@ -1094,14 +1380,106 @@ function budgetThresholdCrossings(before, after, settings) {
   };
 }
 
-function recordUsageGap(result, reason) {
+function buildRollupBudgetSnapshot(rollup, settings, nowMs) {
+  const daily = {
+    ...budgetState(
+      settings.budgets.daily_eur,
+      rollup.today.cost_eur_nanos,
+    ),
+    complete: rollup.today.complete,
+    pending_turns: rollup.today.pending_turns,
+  };
+  const monthly = {
+    ...budgetState(
+      settings.budgets.monthly_eur,
+      rollup.month.cost_eur_nanos,
+    ),
+    complete: rollup.month.complete,
+    pending_turns: rollup.month.pending_turns,
+  };
+  const forecastEurNanos = projectMonthEndNanos(
+    rollup.month.cost_eur_nanos,
+    nowMs,
+    rollup.timezone,
+  );
+  return {
+    budgets: {
+      daily,
+      monthly,
+      warning_thresholds_percent:
+        settings.budgets.warning_thresholds_percent,
+      forecast_eur_nanos: forecastEurNanos,
+      forecast_percentage:
+        monthly.limit_eur_nanos === null
+          ? null
+          : (forecastEurNanos / monthly.limit_eur_nanos) * 100,
+      forecast_complete: rollup.month.complete,
+    },
+  };
+}
+
+function buildLedgerView(
+  result,
+  settings,
+  nowMs,
+  beforeRollup,
+  afterRollup,
+  appendResult,
+) {
+  const beforeBudgetSnapshot = buildRollupBudgetSnapshot(
+    beforeRollup,
+    settings,
+    nowMs,
+  );
+  const snapshot = buildRollupBudgetSnapshot(
+    afterRollup,
+    settings,
+    nowMs,
+  );
+
+  result.session = {
+    usage: afterRollup.session.usage,
+    cost:
+      nanosToEuros(afterRollup.session.cost_eur_nanos) / EUR_PER_USD,
+    costEur: nanosToEuros(afterRollup.session.cost_eur_nanos),
+  };
+  result.sessionComplete = afterRollup.session.complete;
+  result.sessionPriced = true;
+
+  return {
+    todayCostEur: nanosToEuros(afterRollup.today.cost_eur_nanos),
+    monthCostEur: nanosToEuros(afterRollup.month.cost_eur_nanos),
+    localDate: afterRollup.today.date,
+    month: afterRollup.month.month,
+    monthLabel: monthLabel(nowMs, afterRollup.timezone),
+    timeZone: afterRollup.timezone,
+    ledgerPath: appendResult.ledgerPath,
+    recorded: appendResult.recorded,
+    settings,
+    snapshot,
+    rollup: afterRollup,
+    thresholdCrossings: appendResult.recorded
+      ? budgetThresholdCrossings(
+          beforeBudgetSnapshot,
+          snapshot,
+          settings,
+        )
+      : { daily: [], monthly: [] },
+  };
+}
+
+function recordUsageGap(result, reason, options = {}) {
   const context = result.ledgerContext;
-  const nowMs = hookNowMs();
-  const completedAtMs = completionMs(context.completedAtMs);
+  const nowMs = options.nowMs ?? hookNowMs();
+  const completedAtMs =
+    options.completedAtMs ?? completionMs(context.completedAtMs);
   const appendResult = appendLedgerGap(
     context.dataRoot,
     ledgerGapFor(result, reason, completedAtMs, nowMs),
-    { now: nowMs },
+    {
+      now: nowMs,
+      ...(options.settings ? { settings: options.settings } : {}),
+    },
   );
   result.warnings.push(...appendResult.diagnostics);
   if (appendResult.conflict) {
@@ -1167,49 +1545,67 @@ function updateUsageLedger(result) {
   const loadedSettings = loadSettings(context.dataRoot);
   result.warnings.push(...loadedSettings.diagnostics);
   const settings = loadedSettings.settings;
-  const beforeSnapshot = settings.notifications.windows
-    ? buildSnapshot(context.dataRoot, {
-        settings,
-        now: nowMs,
-      })
-    : null;
-  const before = beforeSnapshot?.complete === true ? beforeSnapshot : null;
+  const beforeRollup = buildHookRollup(context.dataRoot, {
+    settings,
+    now: nowMs,
+    rootThreadId: context.rootThreadId,
+  });
   const appendResult = appendLedgerRecord(
     context.dataRoot,
     ledgerRecordFor(result, completedAtMs, nowMs),
-    { now: nowMs },
+    { now: nowMs, settings },
   );
   result.warnings.push(...appendResult.diagnostics);
   if (appendResult.conflict) {
     throw new Error('A conflicting record already exists for this turn.');
   }
-  const snapshot = buildSnapshot(context.dataRoot, {
+  const afterRollup = buildHookRollup(context.dataRoot, {
     settings,
     now: nowMs,
+    rootThreadId: context.rootThreadId,
   });
-  result.warnings.push(...snapshot.diagnostics);
-  if (!snapshot.complete) {
-    throw new Error(
-      'The usage ledger could not be read completely; aggregate totals were suppressed.',
-    );
-  }
-
-  return {
-    todayCostEur: nanosToEuros(snapshot.today.cost_eur_nanos),
-    monthCostEur: nanosToEuros(snapshot.month.cost_eur_nanos),
-    localDate: snapshot.today.date,
-    month: snapshot.month.month,
-    monthLabel: monthLabel(nowMs, snapshot.timezone),
-    timeZone: snapshot.timezone,
-    ledgerPath: appendResult.ledgerPath,
-    recorded: appendResult.recorded,
+  result.warnings.push(...afterRollup.diagnostics);
+  return buildLedgerView(
+    result,
     settings,
-    snapshot,
-    thresholdCrossings:
-      before && appendResult.recorded
-        ? budgetThresholdCrossings(before, snapshot, settings)
-        : { daily: [], monthly: [] },
-  };
+    nowMs,
+    beforeRollup,
+    afterRollup,
+    appendResult,
+  );
+}
+
+function updateUsageGapLedger(result, reason) {
+  const context = result.ledgerContext;
+  const nowMs = hookNowMs();
+  const completedAtMs = completionMs(context.completedAtMs);
+  const loadedSettings = loadSettings(context.dataRoot);
+  result.warnings.push(...loadedSettings.diagnostics);
+  const settings = loadedSettings.settings;
+  const beforeRollup = buildHookRollup(context.dataRoot, {
+    settings,
+    now: nowMs,
+    rootThreadId: context.rootThreadId,
+  });
+  const appendResult = recordUsageGap(result, reason, {
+    nowMs,
+    completedAtMs,
+    settings,
+  });
+  const afterRollup = buildHookRollup(context.dataRoot, {
+    settings,
+    now: nowMs,
+    rootThreadId: context.rootThreadId,
+  });
+  result.warnings.push(...afterRollup.diagnostics);
+  return buildLedgerView(
+    result,
+    settings,
+    nowMs,
+    beforeRollup,
+    afterRollup,
+    appendResult,
+  );
 }
 
 function modelLabel(models, fallback) {
@@ -1226,8 +1622,8 @@ function modelLabel(models, fallback) {
 function analyze(hookInput) {
   const analysisStarted = performance.now();
   const warnings = [];
-  let complete = true;
-  let warming = false;
+  const analysisDeadline = analysisStarted + ANALYSIS_BUDGET_MS;
+  const currentTurnId = hookInput.turn_id;
   const transcriptPath = resolveTranscriptPath(hookInput.transcript_path);
   if (!transcriptPath || !fs.existsSync(transcriptPath)) {
     throw new Error('The current transcript could not be found.');
@@ -1257,7 +1653,18 @@ function analyze(hookInput) {
     transcriptPath,
     rootMetadata.threadId,
     cacheDirectory,
+    {
+      metadata: rootMetadata,
+      deadlineMs: analysisDeadline,
+      accept: (parsed) =>
+        parsed.taskStarts.some((task) => task.id === currentTurnId),
+    },
   );
+  if (rootParsed.coldWindowLimited) {
+    warnings.push(
+      'The bounded cold read ended before the current root task could be found.',
+    );
+  }
 
   const rootThreadId =
     rootParsed.firstMetadata?.threadId ?? hookInput.session_id ?? null;
@@ -1283,27 +1690,26 @@ function analyze(hookInput) {
     );
   }
 
+  const currentRootTaskStart = rootOwnedTaskStarts.find(
+    (task) => task.id === currentTurnId,
+  );
   const rootAccounting = buildAccounting(
     rootParsed,
-    rootOwnedTaskStarts,
-    rootBranchIndex,
+    currentRootTaskStart ? [currentRootTaskStart] : [],
+    currentRootTaskStart?.index ?? rootBranchIndex,
     hookInput.model,
     warnings,
   );
-  complete &&= rootAccounting.exact;
   for (const task of rootAccounting.tasks.values()) {
     task.rootTurnId = task.id;
   }
 
-  const sessionFileIndex = buildSessionFileIndex(
-    sessionsRoot,
-    cacheDirectory,
-  );
   const accountingByThread = new Map([[rootThreadId, rootAccounting]]);
   const pending = [rootThreadId];
   const visited = new Set([rootThreadId]);
-  const currentTurnId = hookInput.turn_id;
-  let currentTraversalComplete = true;
+  let currentTraversalComplete =
+    !rootParsed.coldWindowLimited &&
+    rootAccounting.exact;
 
   while (pending.length > 0) {
     const parentThreadId = pending.shift();
@@ -1312,45 +1718,38 @@ function analyze(hookInput) {
       continue;
     }
 
-    const spawnActivities = parentAccounting.parsed.activities.filter(
-      (activity) =>
-        activity.kind === 'started' &&
-        activity.index > parentAccounting.branchIndex,
+    const childActivitiesByThread = groupActivitiesByChild(
+      currentChildActivities(parentAccounting, currentTurnId),
     );
 
-    for (const spawnActivity of spawnActivities) {
-      const spawnedForRootTurnId = findActiveTask(
-        parentAccounting,
-        spawnActivity.index,
-      )?.rootTurnId;
+    for (const [childThreadId, childActivities] of childActivitiesByThread) {
       if (performance.now() - analysisStarted > ANALYSIS_BUDGET_MS) {
         warnings.push(
           'The analysis time budget was reached before every subagent could be included.',
         );
-        complete = false;
         currentTraversalComplete = false;
-        warming = true;
         pending.length = 0;
         break;
       }
 
-      const childThreadId = spawnActivity.childThreadId;
       if (visited.has(childThreadId)) {
         continue;
       }
 
-      const childMetadata = findChildMetadata(
-        sessionFileIndex,
+      const representativeActivity = childActivities[0];
+      const childMetadata = findChildSessionMetadata(
+        sessionsRoot,
         childThreadId,
         parentThreadId,
         rootSessionId,
+        {
+          parentFilePath: parentAccounting.parsed.filePath,
+          occurredAtMs: representativeActivity.occurredAtMs,
+        },
       );
       if (!childMetadata) {
         warnings.push(`Missing or mismatched rollout for subagent ${childThreadId}.`);
-        complete = false;
-        if (spawnedForRootTurnId === currentTurnId) {
-          currentTraversalComplete = false;
-        }
+        currentTraversalComplete = false;
         continue;
       }
 
@@ -1365,56 +1764,76 @@ function analyze(hookInput) {
         childMetadata.filePath,
         childThreadId,
         cacheDirectory,
+        {
+          metadata: childMetadata,
+          deadlineMs: analysisDeadline,
+          accept: (parsed, window) => {
+            const selection = selectChildTasks(
+              parentAccounting.parsed,
+              parsed,
+              childActivities,
+            );
+            return (
+              selection.complete &&
+              selection.tasks.length > 0 &&
+              !(window.truncated && reusesSelectedTask(selection))
+            );
+          },
+        },
       );
+      if (childParsed.coldWindowLimited) {
+        warnings.push(
+          `The bounded cold read ended before subagent ${childThreadId} could be isolated.`,
+        );
+        currentTraversalComplete = false;
+      }
       if (performance.now() - analysisStarted > ANALYSIS_BUDGET_MS) {
         warnings.push(
           'The analysis time budget was reached before every subagent could be included.',
         );
-        complete = false;
         currentTraversalComplete = false;
-        warming = true;
         pending.length = 0;
         break;
       }
-      const branchTask = selectChildBranch(
+      const selected = selectChildTasks(
         parentAccounting.parsed,
         childParsed,
-        spawnActivity,
+        childActivities,
       );
-      if (!branchTask) {
+      if (!selected.complete || selected.tasks.length === 0) {
         warnings.push(`Could not find the branch point for subagent ${childThreadId}.`);
-        complete = false;
-        if (spawnedForRootTurnId === currentTurnId) {
-          currentTraversalComplete = false;
-        }
+        currentTraversalComplete = false;
+      }
+      if (selected.tasks.length === 0) {
         continue;
       }
 
-      const ownedTaskStarts = childParsed.taskStarts.filter(
-        (task) => task.index >= branchTask.index,
-      );
       const childAccounting = buildAccounting(
         childParsed,
-        ownedTaskStarts,
-        branchTask.index,
+        selected.tasks,
+        selected.tasks[0].index,
         hookInput.model,
         warnings,
       );
-      complete &&= childAccounting.exact;
+      currentTraversalComplete &&= childAccounting.exact;
       const childMappingExact = mapChildTasksToRoot(
         parentAccounting,
         childAccounting,
         childThreadId,
+        selected.matches,
         warnings,
       );
-      complete = complete && childMappingExact;
+      if (!childMappingExact) {
+        currentTraversalComplete = false;
+      }
       if (
-        !childMappingExact &&
-        (spawnedForRootTurnId === currentTurnId ||
-          [...childAccounting.tasks.values()].some(
-            (task) => task.rootTurnId === currentTurnId,
-          ))
+        [...childAccounting.tasks.values()].some(
+          (task) => task.rootTurnId !== currentTurnId,
+        )
       ) {
+        warnings.push(
+          `Could not isolate subagent ${childThreadId} to the current root turn.`,
+        );
         currentTraversalComplete = false;
       }
 
@@ -1424,7 +1843,6 @@ function analyze(hookInput) {
     }
   }
 
-  const sessionSegments = [];
   const turnSegments = [];
   const currentRootTask = rootAccounting.tasks.get(currentTurnId);
   const turnAgentThreadIds = new Set();
@@ -1435,7 +1853,6 @@ function analyze(hookInput) {
         ...segment,
         agentRole: threadId === rootThreadId ? 'root' : 'subagent',
       };
-      sessionSegments.push(scopedSegment);
       const task = segment.taskId ? accounting.tasks.get(segment.taskId) : null;
       if (task?.rootTurnId === currentTurnId) {
         turnSegments.push(scopedSegment);
@@ -1465,20 +1882,14 @@ function analyze(hookInput) {
   }
 
   const turnUsage = usageForSegments(turnSegments);
-  const sessionUsage = usageForSegments(sessionSegments);
   const lastTurnUsageMs = turnSegments.reduce(
     (latest, segment) => Math.max(latest, segment.timestampMs),
     Number.NEGATIVE_INFINITY,
   );
   const turnPricing = priceSegments(turnSegments);
-  const sessionPricing = priceSegments(sessionSegments);
   const breakdown = turnBreakdown(turnSegments, turnAgentThreadIds.size);
-  const unpricedModels = new Set([
-    ...turnPricing.unpricedModels,
-    ...sessionPricing.unpricedModels,
-  ]);
+  const unpricedModels = turnPricing.unpricedModels;
   const turnPriced = turnPricing.unpricedModels.size === 0;
-  const sessionPriced = sessionPricing.unpricedModels.size === 0;
 
   if (unpricedModels.size > 0) {
     warnings.push(`No hardcoded price for: ${[...unpricedModels].join(', ')}.`);
@@ -1487,16 +1898,16 @@ function analyze(hookInput) {
   return {
     skip: false,
     pricingAsOf: PRICING_AS_OF,
-    model: modelLabel(sessionPricing.models, hookInput.model),
+    model: modelLabel(turnPricing.models, hookInput.model),
     agentThreads: Math.max(0, accountingByThread.size - 1),
     turnAgentThreads: turnAgentThreadIds.size,
     complete: turnComplete,
     turnComplete,
-    sessionComplete: complete,
-    warming,
-    priced: turnPriced && sessionPriced,
+    sessionComplete: false,
+    warming: false,
+    priced: turnPriced,
     turnPriced,
-    sessionPriced,
+    sessionPriced: false,
     turn: {
       usage: turnUsage,
       cost: turnPricing.cost,
@@ -1504,9 +1915,9 @@ function analyze(hookInput) {
       ...breakdown,
     },
     session: {
-      usage: sessionUsage,
-      cost: sessionPricing.cost,
-      costEur: eurosFromUsd(sessionPricing.cost),
+      usage: zeroUsage(),
+      cost: 0,
+      costEur: 0,
     },
     ledgerContext: {
       dataRoot,
@@ -1526,10 +1937,12 @@ function analyze(hookInput) {
 function buildSystemMessage(result) {
   const turnComplete = result.turnComplete ?? result.complete;
   const sessionComplete = result.sessionComplete ?? result.complete;
-  if (!turnComplete) {
-    return result.warming
-      ? 'Usage unavailable — agent-history cache is warming; affected aggregates remain unavailable.'
-      : 'Usage unavailable — see hook diagnostics.';
+  const turnHasKnownLowerBound =
+    !turnComplete &&
+    result.turnPriced &&
+    hasUsage(result.turn.usage);
+  if (!turnComplete && !turnHasKnownLowerBound && !result.ledger) {
+    return 'Usage unavailable — see hook diagnostics.';
   }
 
   const turnCost = result.turnPriced ?? result.priced
@@ -1538,18 +1951,58 @@ function buildSystemMessage(result) {
   const sessionCost = result.sessionPriced ?? result.priced
     ? formatEuroCost(result.session.costEur)
     : 'cost unavailable';
+  let turnGroup;
+  if (turnComplete) {
+    turnGroup =
+      `Turn + agents ${formatCompactTokens(
+        result.turn.usage.total_tokens,
+      )} tok · ${turnCost}`;
+  } else if (turnHasKnownLowerBound) {
+    turnGroup =
+      `Turn + agents ≥${formatCompactTokens(
+        result.turn.usage.total_tokens,
+      )} tok · ≥${turnCost}`;
+  } else {
+    turnGroup = 'Turn + agents unavailable';
+  }
+
+  const sessionScope = result.ledger?.rollup?.session;
+  let sessionGroup = 'Session + agents unavailable';
+  if (sessionComplete) {
+    sessionGroup =
+      `Session + agents ${formatCompactTokens(
+        result.session.usage.total_tokens,
+      )} tok · ${sessionCost}`;
+  } else if (sessionScope) {
+    const pending = sessionScope.pending_turns;
+    sessionGroup =
+      `Session + agents ≥${formatCompactTokens(
+        result.session.usage.total_tokens,
+      )} tok · ≥${sessionCost} · ${pending} pending`;
+  }
+
   const primaryGroups = [
-    `Turn + agents ${formatCompactTokens(result.turn.usage.total_tokens)} tok · ${turnCost}`,
-    sessionComplete
-      ? `Session + agents ${formatCompactTokens(result.session.usage.total_tokens)} tok · ${sessionCost}`
-      : 'Session + agents unavailable',
+    turnGroup,
+    sessionGroup,
   ];
   const secondaryGroups = [];
 
   if (result.ledger) {
-    secondaryGroups.push(`Today ${formatEuroCost(result.ledger.todayCostEur)}`);
+    const today = result.ledger.rollup?.today;
+    const month = result.ledger.rollup?.month;
     secondaryGroups.push(
-      `${result.ledger.monthLabel} ${formatEuroCost(result.ledger.monthCostEur)}`,
+      today?.complete === false
+        ? `Today ≥${formatEuroCost(result.ledger.todayCostEur)} · ${today.pending_turns} pending`
+        : `Today ${formatEuroCost(result.ledger.todayCostEur)}`,
+    );
+    secondaryGroups.push(
+      month?.complete === false
+        ? `${result.ledger.monthLabel} ≥${formatEuroCost(
+            result.ledger.monthCostEur,
+          )} · ${month.pending_turns} pending`
+        : `${result.ledger.monthLabel} ${formatEuroCost(
+            result.ledger.monthCostEur,
+          )}`,
     );
   }
   secondaryGroups.push(result.model);
@@ -1577,17 +2030,22 @@ function buildSystemMessage(result) {
       if (budget.limit_eur_nanos === null) {
         continue;
       }
+      const lowerBound = budget.complete === false;
       const percentage = Math.round(budget.percentage);
       const balance =
         budget.over_eur_nanos > 0
-          ? `${formatEuroCost(nanosToEuros(budget.over_eur_nanos))} over`
-          : `${formatEuroCost(
+          ? `${lowerBound ? '≥' : ''}${formatEuroCost(
+              nanosToEuros(budget.over_eur_nanos),
+            )} over`
+          : `${lowerBound ? '≤' : ''}${formatEuroCost(
               nanosToEuros(budget.remaining_eur_nanos),
             )} left`;
-      budgetGroups.push(`${label} ${percentage}% · ${balance}`);
+      budgetGroups.push(
+        `${label} ${lowerBound ? '≥' : ''}${percentage}% · ${balance}`,
+      );
     }
     budgetGroups.push(
-      `Forecast ${formatEuroCost(
+      `Forecast ${budgets.forecast_complete === false ? '≥' : ''}${formatEuroCost(
         nanosToEuros(budgets.forecast_eur_nanos),
       )}`,
     );
@@ -1604,12 +2062,15 @@ function buildSystemMessage(result) {
         usage.cached_input_tokens -
         usage.cache_write_input_tokens,
     );
+    const lowerBound = turnComplete ? '' : '≥';
     lines.push(
       [
-        `Breakdown: Root ${formatEuroCost(root.costEur)}`,
-        `Agents ${formatEuroCost(subagents.costEur)}`,
-        `Fresh ${formatCompactTokens(freshInput)} tok`,
-        `Cached ${formatCompactTokens(usage.cached_input_tokens)} tok`,
+        `Breakdown: Root ${lowerBound}${formatEuroCost(root.costEur)}`,
+        `Agents ${lowerBound}${formatEuroCost(subagents.costEur)}`,
+        `Fresh ${lowerBound}${formatCompactTokens(freshInput)} tok`,
+        `Cached ${lowerBound}${formatCompactTokens(
+          usage.cached_input_tokens,
+        )} tok`,
       ]
         .map(noBreak)
         .join(' │ '),
@@ -1755,7 +2216,11 @@ function main() {
           ? 'history_incomplete'
           : 'usage_unavailable';
       try {
-        recordUsageGap(result, reason);
+        result.ledger = updateUsageGapLedger(result, reason);
+        const notificationWarning = maybeSendWindowsNotification(result.ledger);
+        if (notificationWarning) {
+          result.warnings.push(notificationWarning);
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         result.warnings.push(
@@ -1817,6 +2282,7 @@ module.exports = {
   recordFatalUsageGap,
   recordUsageGap,
   turnBreakdown,
+  updateUsageGapLedger,
   updateUsageLedger,
   windowsNotificationCommand,
 };

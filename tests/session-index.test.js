@@ -10,6 +10,8 @@ const {
   readSessionMetadata,
   buildSessionFileIndex,
   findChildMetadata,
+  findChildSessionMetadata,
+  uuidV7TimestampMs,
 } = require('../plugins/codex-cost-meter/lib/session-index');
 
 function sessionMeta(
@@ -159,6 +161,149 @@ test('reads the existing first-line session metadata shape', () => {
     isSubagent: true,
     startedMs: Date.parse('2026-08-20T12:00:00.000Z'),
   });
+});
+
+test('derives a UUIDv7 rollout day and performs a suffix-targeted lookup', () => {
+  const fixtureRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'session-index-targeted-'),
+  );
+  const sessionsRoot = path.join(fixtureRoot, 'sessions');
+  const childId = '01a0208e-2129-73a1-8223-d92165c80424';
+  const childPath = writeRollout(
+    sessionsRoot,
+    `2026/08/20/rollout-2026-08-20T19-03-00-${childId}.jsonl`,
+    sessionMeta(childId, 'root-session', 'parent-thread'),
+  );
+  writeRollout(
+    sessionsRoot,
+    `2026/08/19/rollout-unrelated-${childId}.jsonl`,
+    sessionMeta(childId, 'other-session', 'other-parent'),
+  );
+
+  assert.equal(
+    new Date(uuidV7TimestampMs(childId)).toISOString(),
+    '2026-08-20T19:03:00.649Z',
+  );
+  const observed = countSessionFsOperations(sessionsRoot, () =>
+    findChildSessionMetadata(
+      sessionsRoot,
+      childId,
+      'parent-thread',
+      'root-session',
+    ),
+  );
+  assert.equal(observed.result.filePath, childPath);
+  assert.deepEqual(observed.readdirPaths, ['2026/08/20']);
+  assert.deepEqual(observed.statPaths, []);
+});
+
+test('checks adjacent bounded days for UUIDv7 midnight rollouts', () => {
+  const fixtureRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'session-index-targeted-midnight-'),
+  );
+  const sessionsRoot = path.join(fixtureRoot, 'sessions');
+  const timestampMs = Date.parse('2026-08-20T00:00:00.100Z');
+  const timestampHex = timestampMs.toString(16).padStart(12, '0');
+  const childId =
+    `${timestampHex.slice(0, 8)}-${timestampHex.slice(8)}-` +
+    '7000-8000-000000000001';
+  const childPath = writeRollout(
+    sessionsRoot,
+    `2026/08/19/rollout-local-date-${childId}.jsonl`,
+    sessionMeta(childId, 'root-session', 'parent-thread'),
+  );
+
+  const observed = countSessionFsOperations(sessionsRoot, () =>
+    findChildSessionMetadata(
+      sessionsRoot,
+      childId,
+      'parent-thread',
+      'root-session',
+    ),
+  );
+  assert.equal(observed.result.filePath, childPath);
+  assert.deepEqual(observed.readdirPaths, [
+    '2026/08/20',
+    '2026/08/19',
+  ]);
+});
+
+test('limits non-UUID fallback lookup to explicit candidate days', () => {
+  const fixtureRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'session-index-targeted-fallback-'),
+  );
+  const sessionsRoot = path.join(fixtureRoot, 'sessions');
+  const parentPath = writeRollout(
+    sessionsRoot,
+    '2026/08/20/rollout-parent-thread.jsonl',
+    sessionMeta('parent-thread', 'root-session'),
+  );
+  const childPath = writeRollout(
+    sessionsRoot,
+    '2026/08/20/rollout-test-child-thread.jsonl',
+    sessionMeta('child-thread', 'root-session', 'parent-thread'),
+  );
+  writeRollout(
+    sessionsRoot,
+    '2025/01/01/rollout-test-child-thread.jsonl',
+    sessionMeta('child-thread', 'root-session', 'parent-thread'),
+  );
+
+  const observed = countSessionFsOperations(sessionsRoot, () =>
+    findChildSessionMetadata(
+      sessionsRoot,
+      'child-thread',
+      'parent-thread',
+      'root-session',
+      {
+        parentFilePath: parentPath,
+        occurredAtMs: Date.parse('2026-08-21T00:00:01.000Z'),
+      },
+    ),
+  );
+  assert.equal(observed.result.filePath, childPath);
+  assert.deepEqual(observed.readdirPaths, ['2026/08/20']);
+
+  const unsafe = countSessionFsOperations(sessionsRoot, () =>
+    findChildSessionMetadata(
+      sessionsRoot,
+      '../child-thread',
+      'parent-thread',
+      'root-session',
+      { parentFilePath: parentPath },
+    ),
+  );
+  assert.equal(unsafe.result, null);
+  assert.deepEqual(unsafe.readdirPaths, []);
+  assert.deepEqual(unsafe.statPaths, []);
+});
+
+test('rejects targeted rollout candidates with mismatched lineage', () => {
+  const fixtureRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'session-index-targeted-lineage-'),
+  );
+  const sessionsRoot = path.join(fixtureRoot, 'sessions');
+  const parentPath = writeRollout(
+    sessionsRoot,
+    '2026/08/20/rollout-parent-thread.jsonl',
+    sessionMeta('parent-thread', 'root-session'),
+  );
+  writeRollout(
+    sessionsRoot,
+    '2026/08/20/rollout-test-child-thread.jsonl',
+    sessionMeta('child-thread', 'other-session', 'other-parent'),
+  );
+
+  assert.equal(
+    findChildSessionMetadata(
+      sessionsRoot,
+      'child-thread',
+      'parent-thread',
+      'root-session',
+      { parentFilePath: parentPath },
+    ),
+    null,
+  );
 });
 
 test('reuses cached metadata without reopening unchanged or appended rollouts', () => {

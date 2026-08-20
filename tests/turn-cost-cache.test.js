@@ -10,6 +10,9 @@ const {
   parseRolloutCached,
   windowsNotificationCommand,
 } = require('../plugins/codex-cost-meter/scripts/turn-cost');
+const turnCostPath = require.resolve(
+  '../plugins/codex-cost-meter/scripts/turn-cost',
+);
 
 function line(timestamp, type, payload) {
   return JSON.stringify({ timestamp, type, payload });
@@ -47,6 +50,12 @@ function tokenRecord(timestamp, inputTokens, outputTokens) {
     },
   });
 }
+
+test('Stop hook hot path does not use the general ledger snapshot builder', () => {
+  const source = fs.readFileSync(turnCostPath, 'utf8');
+  assert.doesNotMatch(source, /\bbuildSnapshot\b/);
+  assert.doesNotMatch(source, /cache is warming/i);
+});
 
 test('incremental rollout cache reads only newly appended bytes', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rollout-cache-'));

@@ -7,10 +7,107 @@ const INDEX_SCHEMA = 2;
 const INDEX_FILE_NAME = 'session-index.json';
 const MAX_FIRST_LINE_BYTES = 4 * 1024 * 1024;
 const READ_CHUNK_BYTES = 64 * 1024;
+const SAFE_THREAD_ID = /^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,126}[A-Za-z0-9])?$/;
+const UUID_V7 =
+  /^([0-9a-f]{8})-([0-9a-f]{4})-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function parseTimestamp(value) {
   const parsed = Date.parse(value ?? '');
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function uuidV7TimestampMs(value) {
+  const match = UUID_V7.exec(value ?? '');
+  if (!match) {
+    return null;
+  }
+
+  const timestampMs = Number.parseInt(`${match[1]}${match[2]}`, 16);
+  return Number.isSafeInteger(timestampMs) ? timestampMs : null;
+}
+
+function utcDayParts(timestampMs) {
+  if (!Number.isFinite(timestampMs)) {
+    return null;
+  }
+  const date = new Date(timestampMs);
+  if (!Number.isFinite(date.getTime())) {
+    return null;
+  }
+  return [
+    String(date.getUTCFullYear()).padStart(4, '0'),
+    String(date.getUTCMonth() + 1).padStart(2, '0'),
+    String(date.getUTCDate()).padStart(2, '0'),
+  ];
+}
+
+function sessionDayPartsForFile(sessionsRoot, filePath) {
+  if (typeof filePath !== 'string' || filePath.length === 0) {
+    return null;
+  }
+
+  const root = path.resolve(sessionsRoot);
+  const directory = path.dirname(path.resolve(filePath));
+  const relative = path.relative(root, directory);
+  if (
+    relative === '' ||
+    path.isAbsolute(relative) ||
+    relative.split(path.sep).includes('..')
+  ) {
+    return null;
+  }
+
+  const parts = relative.split(path.sep);
+  if (
+    parts.length !== 3 ||
+    !/^\d{4}$/.test(parts[0]) ||
+    !/^\d{2}$/.test(parts[1]) ||
+    !/^\d{2}$/.test(parts[2])
+  ) {
+    return null;
+  }
+
+  const timestampMs = Date.UTC(
+    Number(parts[0]),
+    Number(parts[1]) - 1,
+    Number(parts[2]),
+  );
+  const normalized = utcDayParts(timestampMs);
+  return normalized?.every((part, index) => part === parts[index])
+    ? parts
+    : null;
+}
+
+function targetedDayDirectories(sessionsRoot, threadId, options = {}) {
+  const root = path.resolve(sessionsRoot);
+  const candidates = [];
+  const seen = new Set();
+
+  function add(parts) {
+    if (!parts) {
+      return;
+    }
+    const key = parts.join('/');
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    candidates.push(path.join(root, ...parts));
+  }
+
+  function addAround(timestampMs) {
+    if (!Number.isFinite(timestampMs)) {
+      return;
+    }
+    for (const dayOffset of [0, -1, 1]) {
+      add(utcDayParts(timestampMs + dayOffset * 24 * 60 * 60 * 1000));
+    }
+  }
+
+  addAround(uuidV7TimestampMs(threadId));
+  add(sessionDayPartsForFile(root, options.parentFilePath));
+  addAround(options.occurredAtMs);
+  return candidates;
 }
 
 function readFirstLine(filePath) {
@@ -696,8 +793,58 @@ function findChildMetadata(index, threadId, parentThreadId, sessionId) {
   return null;
 }
 
+function findChildSessionMetadata(
+  sessionsRoot,
+  threadId,
+  parentThreadId,
+  sessionId,
+  options = {},
+) {
+  if (
+    !SAFE_THREAD_ID.test(threadId ?? '') ||
+    !validIdentifier(parentThreadId) ||
+    !validIdentifier(sessionId)
+  ) {
+    return null;
+  }
+
+  const suffix = `-${threadId}.jsonl`;
+  for (const directoryPath of targetedDayDirectories(
+    sessionsRoot,
+    threadId,
+    options,
+  )) {
+    let entries;
+    try {
+      entries = fs.readdirSync(directoryPath, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    entries.sort((left, right) => compareText(left.name, right.name));
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(suffix)) {
+        continue;
+      }
+      const metadata = readSessionMetadata(
+        path.join(directoryPath, entry.name),
+      );
+      if (
+        metadata?.threadId === threadId &&
+        metadata.parentThreadId === parentThreadId &&
+        metadata.sessionId === sessionId
+      ) {
+        return metadata;
+      }
+    }
+  }
+  return null;
+}
+
 module.exports = {
   readSessionMetadata,
   buildSessionFileIndex,
   findChildMetadata,
+  findChildSessionMetadata,
+  uuidV7TimestampMs,
 };

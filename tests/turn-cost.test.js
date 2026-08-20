@@ -15,6 +15,10 @@ const hookPath = path.resolve(
   'scripts',
   'turn-cost.js',
 );
+const {
+  analyze,
+} = require('../plugins/codex-cost-meter/scripts/turn-cost');
+const INITIAL_TEST_COLD_WINDOW_BYTES = 600 * 1024;
 
 function iso(milliseconds) {
   return new Date(milliseconds).toISOString();
@@ -279,9 +283,8 @@ test('aggregates root, child, nested child, duplicates, and follow-up tasks', ()
   const firstResult = JSON.parse(firstTurn.stdout);
   assert.equal(firstResult.agentThreads, 2);
   assert.equal(firstResult.turn.usage.total_tokens, 1970);
-  assert.equal(firstResult.session.usage.total_tokens, 2520);
   assert.ok(Math.abs(firstResult.turn.cost - 0.0112) < 1e-12);
-  assert.ok(Math.abs(firstResult.session.cost - 0.0145875) < 1e-12);
+  assert.equal(firstResult.sessionComplete, false);
   assert.deepEqual(firstResult.warnings, []);
 
   const secondTurn = invoke(rootPath, rootId, rootTurnTwo);
@@ -299,7 +302,578 @@ test('aggregates root, child, nested child, duplicates, and follow-up tasks', ()
   );
 });
 
-test('prices the current turn even when an earlier session turn is unpriced', () => {
+test('maps same-second same-thread activities to distinct child tasks', () => {
+  const fixtureRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'turn-cost-same-second-child-'),
+  );
+  const sessionsDay = path.join(
+    fixtureRoot,
+    '.codex',
+    'sessions',
+    '2026',
+    '08',
+    '20',
+  );
+  fs.mkdirSync(sessionsDay, { recursive: true });
+
+  const rootId = 'same-second-root';
+  const childId = 'same-second-child';
+  const rootTurn = 'same-second-root-turn';
+  const childTurnOne = 'same-second-child-one';
+  const childTurnTwo = 'same-second-child-two';
+  const rootUsage = usage(100, 20, 10, 10);
+  const childOne = usage(50, 10, 5, 5);
+  const childTwo = usage(70, 20, 5, 7);
+  const afterChildOne = add(rootUsage, childOne);
+  const afterChildTwo = add(afterChildOne, childTwo);
+
+  const rootPath = writeRollout(sessionsDay, rootId, [
+    sessionMeta(2_000_000, rootId, rootId),
+    taskStarted(2_000_000, rootTurn),
+    turnContext(2_000_010, rootTurn),
+    tokenRecord(2_000_100, rootUsage, rootUsage),
+    activity(2_000_200, childId, 'started'),
+    activity(2_000_600, childId, 'interacted'),
+    taskComplete(2_000_900, rootTurn),
+  ]);
+  writeRollout(sessionsDay, childId, [
+    sessionMeta(2_000_200, childId, rootId, rootId),
+    taskStarted(2_000_000, rootTurn),
+    turnContext(2_000_010, rootTurn),
+    tokenRecord(2_000_100, rootUsage, rootUsage),
+    taskStarted(2_000_200, childTurnOne),
+    turnContext(2_000_210, childTurnOne),
+    tokenRecord(2_000_300, afterChildOne, childOne),
+    taskComplete(2_000_500, childTurnOne),
+    taskStarted(2_000_600, childTurnTwo),
+    turnContext(2_000_610, childTurnTwo),
+    tokenRecord(2_000_700, afterChildTwo, childTwo),
+    taskComplete(2_000_800, childTurnTwo),
+  ]);
+
+  const invocation = invoke(rootPath, rootId, rootTurn);
+  assert.equal(invocation.status, 0, invocation.stderr);
+  const result = JSON.parse(invocation.stdout);
+  assert.equal(result.turnComplete, true);
+  assert.equal(result.turnAgentThreads, 1);
+  assert.equal(
+    result.turn.usage.total_tokens,
+    rootUsage.total_tokens +
+      childOne.total_tokens +
+      childTwo.total_tokens,
+  );
+  assert.deepEqual(result.warnings, []);
+});
+
+test('does not reuse a stale open child task for a later interaction', () => {
+  const fixtureRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'turn-cost-stale-child-'),
+  );
+  const sessionsDay = path.join(
+    fixtureRoot,
+    '.codex',
+    'sessions',
+    '2026',
+    '08',
+    '20',
+  );
+  fs.mkdirSync(sessionsDay, { recursive: true });
+
+  const rootId = 'stale-child-root';
+  const childId = 'stale-child-thread';
+  const oldRootTurn = 'stale-old-root-turn';
+  const currentRootTurn = 'stale-current-root-turn';
+  const staleChildTurn = 'stale-open-child-turn';
+  const oldRootUsage = usage(1_000, 400, 100, 100);
+  const staleChildUsage = usage(500, 200, 50, 50);
+  const currentRootUsage = usage(200, 50, 10, 20);
+  const rootCumulative = add(oldRootUsage, currentRootUsage);
+
+  const rootPath = writeRollout(sessionsDay, rootId, [
+    sessionMeta(1_000_000, rootId, rootId),
+    taskStarted(1_000_000, oldRootTurn),
+    turnContext(1_000_010, oldRootTurn),
+    tokenRecord(1_000_100, oldRootUsage, oldRootUsage),
+    activity(1_000_200, childId, 'started'),
+    taskComplete(1_000_500, oldRootTurn),
+    taskStarted(2_000_000, currentRootTurn),
+    turnContext(2_000_010, currentRootTurn),
+    tokenRecord(2_000_100, rootCumulative, currentRootUsage),
+    activity(2_000_200, childId, 'interacted'),
+    activity(2_000_300, childId, 'interrupted'),
+    taskComplete(2_000_500, currentRootTurn),
+  ]);
+  writeRollout(sessionsDay, childId, [
+    sessionMeta(1_000_200, childId, rootId, rootId),
+    taskStarted(1_000_000, oldRootTurn),
+    turnContext(1_000_010, oldRootTurn),
+    tokenRecord(1_000_100, oldRootUsage, oldRootUsage),
+    taskStarted(1_000_200, staleChildTurn),
+    turnContext(1_000_210, staleChildTurn),
+    tokenRecord(
+      1_000_300,
+      add(oldRootUsage, staleChildUsage),
+      staleChildUsage,
+    ),
+  ]);
+
+  const invocation = invoke(rootPath, rootId, currentRootTurn);
+  assert.equal(invocation.status, 0, invocation.stderr);
+  const result = JSON.parse(invocation.stdout);
+  assert.equal(result.turnComplete, false);
+  assert.equal(
+    result.turn.usage.total_tokens,
+    currentRootUsage.total_tokens,
+  );
+  assert.equal(result.turnAgentThreads, 0);
+  assert.match(result.warnings.join('\n'), /branch point/);
+});
+
+test('keeps a legitimate started and interacted activity on one open child task', () => {
+  const fixtureRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'turn-cost-open-child-reuse-'),
+  );
+  const sessionsDay = path.join(
+    fixtureRoot,
+    '.codex',
+    'sessions',
+    '2026',
+    '08',
+    '20',
+  );
+  fs.mkdirSync(sessionsDay, { recursive: true });
+
+  const rootId = 'open-child-reuse-root';
+  const childId = 'open-child-reuse-thread';
+  const rootTurn = 'open-child-reuse-root-turn';
+  const childTurn = 'open-child-reuse-child-turn';
+  const rootUsage = usage(100, 20, 10, 10);
+  const childUsage = usage(50, 10, 5, 5);
+
+  const rootPath = writeRollout(sessionsDay, rootId, [
+    sessionMeta(2_000_000, rootId, rootId),
+    taskStarted(2_000_000, rootTurn),
+    turnContext(2_000_010, rootTurn),
+    tokenRecord(2_000_100, rootUsage, rootUsage),
+    activity(2_000_200, childId, 'started'),
+    activity(2_000_400, childId, 'interacted'),
+    activity(2_000_800, childId, 'interrupted'),
+    taskComplete(2_000_900, rootTurn),
+  ]);
+  writeRollout(sessionsDay, childId, [
+    sessionMeta(2_000_200, childId, rootId, rootId),
+    taskStarted(2_000_000, rootTurn),
+    turnContext(2_000_010, rootTurn),
+    tokenRecord(2_000_100, rootUsage, rootUsage),
+    taskStarted(2_000_200, childTurn),
+    turnContext(2_000_210, childTurn),
+    tokenRecord(
+      2_000_500,
+      add(rootUsage, childUsage),
+      childUsage,
+    ),
+  ]);
+
+  const invocation = invoke(rootPath, rootId, rootTurn);
+  assert.equal(invocation.status, 0, invocation.stderr);
+  const result = JSON.parse(invocation.stdout);
+  assert.equal(result.turnComplete, true);
+  assert.equal(
+    result.turn.usage.total_tokens,
+    rootUsage.total_tokens + childUsage.total_tokens,
+  );
+  assert.deepEqual(result.warnings, []);
+});
+
+test('cold child analysis expands when visible task reuse is ambiguous', () => {
+  const fixtureRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'turn-cost-cold-child-reuse-'),
+  );
+  const sessionsDay = path.join(
+    fixtureRoot,
+    '.codex',
+    'sessions',
+    '2026',
+    '08',
+    '20',
+  );
+  fs.mkdirSync(sessionsDay, { recursive: true });
+
+  const rootId = 'cold-child-reuse-root';
+  const childId = 'cold-child-reuse-thread';
+  const rootTurn = 'cold-child-reuse-root-turn';
+  const childTurnOne = 'cold-child-reuse-one';
+  const childTurnTwo = 'cold-child-reuse-two';
+  const rootUsage = usage(100, 20, 10, 10);
+  const childOne = usage(1_000, 200, 100, 100);
+  const childTwo = usage(50, 10, 5, 5);
+  const afterChildOne = add(rootUsage, childOne);
+  const afterChildTwo = add(afterChildOne, childTwo);
+
+  const rootPath = writeRollout(sessionsDay, rootId, [
+    sessionMeta(2_000_000, rootId, rootId),
+    taskStarted(2_000_000, rootTurn),
+    turnContext(2_000_010, rootTurn),
+    tokenRecord(2_000_100, rootUsage, rootUsage),
+    activity(2_000_200, childId, 'started'),
+    activity(2_005_000, childId, 'interacted'),
+    activity(2_005_500, childId, 'interrupted'),
+    taskComplete(2_005_900, rootTurn),
+  ]);
+  writeRollout(sessionsDay, childId, [
+    sessionMeta(2_000_200, childId, rootId, rootId),
+    taskStarted(2_000_000, rootTurn),
+    turnContext(2_000_010, rootTurn),
+    tokenRecord(2_000_100, rootUsage, rootUsage),
+    taskStarted(2_000_200, childTurnOne),
+    turnContext(2_000_210, childTurnOne),
+    tokenRecord(2_000_300, afterChildOne, childOne),
+    taskComplete(2_001_000, childTurnOne),
+    record(2_001_100, 'event_msg', {
+      type: 'historical_padding',
+      value: 'x'.repeat(700 * 1024),
+    }),
+    taskStarted(2_005_000, childTurnTwo),
+    turnContext(2_005_010, childTurnTwo),
+    tokenRecord(2_005_100, afterChildTwo, childTwo),
+  ]);
+
+  const invocation = invoke(rootPath, rootId, rootTurn);
+  assert.equal(invocation.status, 0, invocation.stderr);
+  const result = JSON.parse(invocation.stdout);
+  assert.equal(result.turnComplete, true);
+  assert.equal(
+    result.turn.usage.total_tokens,
+    rootUsage.total_tokens +
+      childOne.total_tokens +
+      childTwo.total_tokens,
+  );
+  assert.deepEqual(result.warnings, []);
+});
+
+test('cold current-turn analysis ignores unrelated historical rollouts', () => {
+  const fixtureRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'turn-cost-targeted-cold-'),
+  );
+  const sessionsRoot = path.join(fixtureRoot, '.codex', 'sessions');
+  const sessionsDay = path.join(sessionsRoot, '2026', '08', '20');
+  const pluginData = path.join(fixtureRoot, 'analysis-plugin-data');
+  const normalPluginData = path.join(fixtureRoot, 'normal-plugin-data');
+  fs.mkdirSync(sessionsDay, { recursive: true });
+
+  const rootId = 'targeted-root';
+  const oldChildId = 'historical-child';
+  const currentChildId = 'current-child';
+  const oldTurn = 'historical-root-turn';
+  const currentTurn = 'current-root-turn';
+  const currentChildTurn = 'current-child-turn';
+  const oldUsage = usage(10_000, 4_000, 1_000, 1_000);
+  const rootUsage = usage(200, 50, 10, 20);
+  const childUsage = usage(100, 25, 5, 10);
+  const rootCumulative = add(oldUsage, rootUsage);
+  const childCumulative = add(rootCumulative, childUsage);
+
+  const rootPath = writeRollout(sessionsDay, rootId, [
+    sessionMeta(1_000_000, rootId, rootId),
+    taskStarted(1_000_000, oldTurn),
+    turnContext(1_000_010, oldTurn),
+    tokenRecord(1_000_100, oldUsage, oldUsage),
+    activity(1_000_200, oldChildId, 'started'),
+    taskComplete(1_000_300, oldTurn),
+    taskStarted(2_000_000, currentTurn),
+    turnContext(2_000_010, currentTurn),
+    tokenRecord(2_000_100, rootCumulative, rootUsage),
+    activity(2_000_200, currentChildId, 'started'),
+    taskComplete(2_000_300, currentTurn),
+  ]);
+  const childPath = writeRollout(sessionsDay, currentChildId, [
+    sessionMeta(2_000_200, currentChildId, rootId, rootId),
+    taskStarted(2_000_000, currentTurn),
+    turnContext(2_000_010, currentTurn),
+    tokenRecord(2_000_100, rootCumulative, rootUsage),
+    taskStarted(2_000_200, currentChildTurn),
+    turnContext(2_000_210, currentChildTurn),
+    tokenRecord(2_000_250, childCumulative, childUsage),
+    taskComplete(2_000_290, currentChildTurn),
+  ]);
+  for (let index = 0; index < 250; index += 1) {
+    writeRollout(
+      sessionsDay,
+      `unrelated-${String(index).padStart(3, '0')}`,
+      [
+        sessionMeta(
+          500_000 + index,
+          `unrelated-${index}`,
+          `unrelated-${index}`,
+        ),
+        taskStarted(500_100 + index, `unrelated-turn-${index}`),
+      ],
+    );
+  }
+
+  const originalOpenSync = fs.openSync;
+  const openedRollouts = [];
+  const sessionsPrefix = `${path.resolve(sessionsRoot)}${path.sep}`;
+  fs.openSync = function patchedOpenSync(filePath, flags, ...rest) {
+    if (
+      flags === 'r' &&
+      typeof filePath === 'string' &&
+      path.resolve(filePath).startsWith(sessionsPrefix) &&
+      filePath.endsWith('.jsonl')
+    ) {
+      openedRollouts.push(path.resolve(filePath));
+    }
+    return originalOpenSync.call(this, filePath, flags, ...rest);
+  };
+  const previousPluginData = process.env.PLUGIN_DATA;
+  process.env.PLUGIN_DATA = pluginData;
+  let result;
+  try {
+    result = analyze({
+      session_id: rootId,
+      turn_id: currentTurn,
+      transcript_path: rootPath,
+      model: 'gpt-5.6-sol',
+      hook_event_name: 'Stop',
+    });
+  } finally {
+    fs.openSync = originalOpenSync;
+    if (previousPluginData === undefined) {
+      delete process.env.PLUGIN_DATA;
+    } else {
+      process.env.PLUGIN_DATA = previousPluginData;
+    }
+  }
+
+  assert.equal(result.turnComplete, true);
+  assert.equal(result.warming, false);
+  assert.equal(
+    result.turn.usage.total_tokens,
+    rootUsage.total_tokens + childUsage.total_tokens,
+  );
+  assert.deepEqual(
+    [...new Set(openedRollouts)].sort(),
+    [path.resolve(childPath), path.resolve(rootPath)].sort(),
+  );
+  assert.equal(
+    openedRollouts.some((filePath) =>
+      path.basename(filePath).includes('historical-child'),
+    ),
+    false,
+  );
+
+  const coldInvocation = invoke(rootPath, rootId, currentTurn, false, {
+    PLUGIN_DATA: normalPluginData,
+  });
+  assert.equal(coldInvocation.status, 0, coldInvocation.stderr);
+  assert.equal(coldInvocation.stderr, '');
+  const coldMessage = JSON.parse(coldInvocation.stdout).systemMessage
+    .replaceAll('\u00a0', ' ');
+  assert.match(coldMessage, /Turn \+ agents 330 tok · €0\.00187/);
+  assert.match(coldMessage, /Session \+ agents 330 tok · €0\.00187/);
+  assert.doesNotMatch(coldMessage, /warming|unavailable/i);
+});
+
+test('cold analysis reads bounded tails of a large root and reused child', () => {
+  const fixtureRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'turn-cost-bounded-cold-'),
+  );
+  const sessionsRoot = path.join(fixtureRoot, '.codex', 'sessions');
+  const sessionsDay = path.join(sessionsRoot, '2026', '08', '20');
+  const pluginData = path.join(fixtureRoot, 'plugin-data');
+  fs.mkdirSync(sessionsDay, { recursive: true });
+
+  const rootId = 'bounded-root';
+  const childId = 'bounded-reused-child';
+  const oldTurn = 'bounded-old-root-turn';
+  const currentTurn = 'bounded-current-root-turn';
+  const oldChildTurn = 'bounded-old-child-turn';
+  const currentChildTurn = 'bounded-current-child-turn';
+  const oldRootUsage = usage(10_000, 4_000, 1_000, 1_000);
+  const oldChildUsage = usage(5_000, 2_000, 500, 500);
+  const rootUsage = usage(200, 50, 10, 20);
+  const childUsage = usage(100, 25, 5, 10);
+  const afterOldChild = add(oldRootUsage, oldChildUsage);
+  const afterCurrentRoot = add(afterOldChild, rootUsage);
+  const afterCurrentChild = add(afterCurrentRoot, childUsage);
+  const historicalPayload = 'x'.repeat(8 * 1024 * 1024);
+
+  const rootPath = writeRollout(sessionsDay, rootId, [
+    sessionMeta(1_000_000, rootId, rootId),
+    taskStarted(1_000_000, oldTurn),
+    turnContext(1_000_010, oldTurn),
+    tokenRecord(1_000_100, oldRootUsage, oldRootUsage),
+    activity(1_000_200, childId, 'started'),
+    taskComplete(1_000_300, oldTurn),
+    record(1_500_000, 'response_item', {
+      type: 'tool_output',
+      output: historicalPayload,
+    }),
+    taskStarted(2_000_000, currentTurn),
+    turnContext(2_000_010, currentTurn),
+    tokenRecord(2_000_100, afterCurrentRoot, rootUsage),
+    activity(2_000_200, childId, 'interacted'),
+    taskComplete(2_000_500, currentTurn),
+  ]);
+  const childPath = writeRollout(sessionsDay, childId, [
+    sessionMeta(1_000_200, childId, rootId, rootId),
+    taskStarted(1_000_000, oldTurn),
+    turnContext(1_000_010, oldTurn),
+    tokenRecord(1_000_100, oldRootUsage, oldRootUsage),
+    taskStarted(1_000_200, oldChildTurn),
+    turnContext(1_000_210, oldChildTurn),
+    tokenRecord(1_000_250, afterOldChild, oldChildUsage),
+    taskComplete(1_000_290, oldChildTurn),
+    record(1_500_000, 'response_item', {
+      type: 'tool_output',
+      output: historicalPayload,
+    }),
+    taskStarted(2_000_000, currentTurn),
+    turnContext(2_000_010, currentTurn),
+    tokenRecord(2_000_100, afterCurrentRoot, rootUsage),
+    taskStarted(2_000_200, currentChildTurn),
+    turnContext(2_000_210, currentChildTurn),
+    tokenRecord(2_000_300, afterCurrentChild, childUsage),
+    taskComplete(2_000_400, currentChildTurn),
+  ]);
+
+  const originalOpenSync = fs.openSync;
+  const originalReadSync = fs.readSync;
+  const originalCloseSync = fs.closeSync;
+  const descriptors = new Map();
+  const explicitReads = [];
+  const targetPaths = new Set([
+    path.resolve(rootPath),
+    path.resolve(childPath),
+  ]);
+  fs.openSync = function patchedOpenSync(filePath, flags, ...rest) {
+    const descriptor = originalOpenSync.call(this, filePath, flags, ...rest);
+    if (
+      flags === 'r' &&
+      typeof filePath === 'string' &&
+      targetPaths.has(path.resolve(filePath))
+    ) {
+      descriptors.set(descriptor, path.resolve(filePath));
+    }
+    return descriptor;
+  };
+  fs.readSync = function patchedReadSync(
+    descriptor,
+    buffer,
+    offset,
+    length,
+    position,
+  ) {
+    const bytesRead = originalReadSync.call(
+      this,
+      descriptor,
+      buffer,
+      offset,
+      length,
+      position,
+    );
+    if (descriptors.has(descriptor) && position !== null) {
+      explicitReads.push({
+        filePath: descriptors.get(descriptor),
+        position,
+        bytesRead,
+      });
+    }
+    return bytesRead;
+  };
+  fs.closeSync = function patchedCloseSync(descriptor) {
+    descriptors.delete(descriptor);
+    return originalCloseSync.call(this, descriptor);
+  };
+
+  const previousPluginData = process.env.PLUGIN_DATA;
+  process.env.PLUGIN_DATA = pluginData;
+  let result;
+  try {
+    result = analyze({
+      session_id: rootId,
+      turn_id: currentTurn,
+      transcript_path: rootPath,
+      model: 'gpt-5.6-sol',
+      hook_event_name: 'Stop',
+    });
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.readSync = originalReadSync;
+    fs.closeSync = originalCloseSync;
+    if (previousPluginData === undefined) {
+      delete process.env.PLUGIN_DATA;
+    } else {
+      process.env.PLUGIN_DATA = previousPluginData;
+    }
+  }
+
+  assert.equal(result.turnComplete, true);
+  assert.equal(
+    result.turn.usage.total_tokens,
+    rootUsage.total_tokens + childUsage.total_tokens,
+  );
+  for (const filePath of targetPaths) {
+    const reads = explicitReads.filter(
+      (read) => read.filePath === filePath,
+    );
+    assert.ok(reads.length > 0);
+    assert.ok(
+      reads.reduce((total, read) => total + read.bytesRead, 0) <=
+        INITIAL_TEST_COLD_WINDOW_BYTES,
+    );
+    assert.ok(
+      Math.min(...reads.map((read) => read.position)) >
+        fs.statSync(filePath).size - INITIAL_TEST_COLD_WINDOW_BYTES,
+    );
+  }
+});
+
+test('cold analysis does not mark an uninferable token baseline exact', () => {
+  const fixtureRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'turn-cost-cold-reset-'),
+  );
+  const sessionsDay = path.join(
+    fixtureRoot,
+    '.codex',
+    'sessions',
+    '2026',
+    '08',
+    '20',
+  );
+  fs.mkdirSync(sessionsDay, { recursive: true });
+
+  const rootId = 'cold-reset-root';
+  const oldTurn = 'cold-reset-old-turn';
+  const currentTurn = 'cold-reset-current-turn';
+  const priorTotal = usage(500, 0, 0, 50);
+  const resetTotal = usage(100, 0, 0, 10);
+  const resetLast = usage(200, 0, 0, 20);
+  const rootPath = writeRollout(sessionsDay, rootId, [
+    sessionMeta(1_000_000, rootId, rootId),
+    taskStarted(1_000_000, oldTurn),
+    turnContext(1_000_010, oldTurn),
+    tokenRecord(1_000_100, priorTotal, priorTotal),
+    taskComplete(1_000_200, oldTurn),
+    record(1_000_300, 'event_msg', {
+      type: 'historical_padding',
+      value: 'x'.repeat(700 * 1024),
+    }),
+    taskStarted(2_000_000, currentTurn),
+    turnContext(2_000_010, currentTurn),
+    tokenRecord(2_000_100, resetTotal, resetLast),
+    taskComplete(2_000_200, currentTurn),
+  ]);
+
+  const invocation = invoke(rootPath, rootId, currentTurn);
+  assert.equal(invocation.status, 0, invocation.stderr);
+  const result = JSON.parse(invocation.stdout);
+  assert.equal(result.turnComplete, false);
+  assert.equal(result.turn.usage.total_tokens, resetLast.total_tokens);
+  assert.match(result.warnings.join('\n'), /Token counter reset/);
+});
+
+test('prices the current turn without revisiting an earlier unpriced turn', () => {
   const fixtureRoot = fs.mkdtempSync(
     path.join(os.tmpdir(), 'turn-cost-mixed-pricing-'),
   );
@@ -339,13 +913,13 @@ test('prices the current turn even when an earlier session turn is unpriced', ()
   const result = JSON.parse(invocation.stdout);
   assert.equal(result.turnPriced, true);
   assert.equal(result.sessionPriced, false);
-  assert.equal(result.priced, false);
+  assert.equal(result.priced, true);
   assert.equal(result.turn.usage.total_tokens, knownUsage.total_tokens);
   assert.ok(result.turn.cost > 0);
-  assert.match(result.warnings.join('\n'), /future-model/);
+  assert.doesNotMatch(result.warnings.join('\n'), /future-model/);
 });
 
-test('does not present partial totals while a child task is still open', () => {
+test('reconciles a known lower-bound gap exactly once after child completion', () => {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'turn-cost-open-'));
   const sessionsDay = path.join(
     fixtureRoot,
@@ -373,7 +947,7 @@ test('does not present partial totals while a child task is still open', () => {
     taskComplete(1_010_000, rootTurn),
   ]);
 
-  writeRollout(sessionsDay, childId, [
+  const childPath = writeRollout(sessionsDay, childId, [
     sessionMeta(1_001_000, childId, rootId, rootId),
     taskStarted(1_000_000, rootTurn),
     turnContext(1_000_010, rootTurn),
@@ -385,11 +959,17 @@ test('does not present partial totals while a child task is still open', () => {
 
   const invocation = invoke(rootPath, rootId, rootTurn, false);
   assert.equal(invocation.status, 0, invocation.stderr);
-  const hookOutput = JSON.parse(invocation.stdout);
-  assert.equal(
-    hookOutput.systemMessage,
-    'Usage unavailable — see hook diagnostics.',
+  const message = JSON.parse(invocation.stdout).systemMessage.replaceAll(
+    '\u00a0',
+    ' ',
   );
+  assert.match(message, /Turn \+ agents ≥165 tok · ≥€0\.00098/);
+  assert.match(
+    message,
+    /Session \+ agents ≥165 tok · ≥€0\.00098 · 1 pending/,
+  );
+  assert.match(message, /Today ≥€0\.00098 · 1 pending/);
+  assert.match(message, /Aug ≥€0\.00098 · 1 pending/);
   assert.match(invocation.stderr, /still open/);
   const entries = readLedgerForRoot(
     defaultUsageRoot(fixtureRoot),
@@ -399,9 +979,49 @@ test('does not present partial totals while a child task is still open', () => {
   assert.equal(entries.length, 1);
   assert.equal(entries[0].entry_type, 'gap');
   assert.equal(entries[0].reason, 'history_incomplete');
+  assert.equal(entries[0].usage, undefined);
+  assert.equal(entries[0].known_usage.total_tokens, 165);
+  assert.equal(entries[0].known_cost_eur_nanos, 975_375);
+
+  fs.appendFileSync(
+    childPath,
+    `${taskComplete(1_002_100, childTurn)}\n`,
+    'utf8',
+  );
+  const exact = invoke(rootPath, rootId, rootTurn, false);
+  assert.equal(exact.status, 0, exact.stderr);
+  const exactMessage = JSON.parse(exact.stdout).systemMessage.replaceAll(
+    '\u00a0',
+    ' ',
+  );
+  assert.match(exactMessage, /Turn \+ agents 165 tok · €0\.00098/);
+  assert.match(exactMessage, /Session \+ agents 165 tok · €0\.00098/);
+  assert.match(exactMessage, /Today €0\.00098/);
+  assert.doesNotMatch(exactMessage, /pending|≥/);
+
+  const repeated = invoke(rootPath, rootId, rootTurn, false);
+  assert.equal(repeated.status, 0, repeated.stderr);
+  assert.equal(
+    JSON.parse(repeated.stdout).systemMessage,
+    JSON.parse(exact.stdout).systemMessage,
+  );
+
+  const reconciledEntries = readLedgerForRoot(
+    defaultUsageRoot(fixtureRoot),
+    '2026-08',
+    rootId,
+  );
+  assert.equal(
+    reconciledEntries.filter((entry) => entry.entry_type === 'gap').length,
+    1,
+  );
+  assert.equal(
+    reconciledEntries.filter((entry) => entry.entry_type !== 'gap').length,
+    1,
+  );
 });
 
-test('records a gap instead of a false zero-cost turn without token evidence', () => {
+test('records a gap and shows zero as a pending lower bound without tokens', () => {
   const fixtureRoot = fs.mkdtempSync(
     path.join(os.tmpdir(), 'turn-cost-no-tokens-'),
   );
@@ -429,10 +1049,13 @@ test('records a gap instead of a false zero-cost turn without token evidence', (
     PLUGIN_DATA: pluginData,
   });
   assert.equal(invocation.status, 0, invocation.stderr);
-  assert.equal(
-    JSON.parse(invocation.stdout).systemMessage,
-    'Usage unavailable — see hook diagnostics.',
+  const message = JSON.parse(invocation.stdout).systemMessage.replaceAll(
+    '\u00a0',
+    ' ',
   );
+  assert.match(message, /Turn \+ agents unavailable/);
+  assert.match(message, /Session \+ agents ≥0 tok · ≥€0\.00000 · 1 pending/);
+  assert.match(message, /Today ≥€0\.00000 · 1 pending/);
   assert.match(invocation.stderr, /without a usable token counter/);
 
   const entries = readLedgerForRoot(
@@ -529,10 +1152,12 @@ test('does not record a hook turn id absent from the root rollout', () => {
     PLUGIN_DATA: pluginData,
   });
   assert.equal(invocation.status, 0, invocation.stderr);
-  assert.equal(
-    JSON.parse(invocation.stdout).systemMessage,
-    'Usage unavailable — see hook diagnostics.',
+  const message = JSON.parse(invocation.stdout).systemMessage.replaceAll(
+    '\u00a0',
+    ' ',
   );
+  assert.match(message, /Turn \+ agents unavailable/);
+  assert.match(message, /Session \+ agents ≥0 tok · ≥€0\.00000 · 1 pending/);
   assert.match(invocation.stderr, /current root task could not be found/i);
 
   const entries = readLedgerForRoot(
@@ -572,14 +1197,39 @@ test('treats a malformed token counter as incomplete accounting', () => {
     malformedTokenRecord(1_000_200),
     taskComplete(1_010_000, rootTurn),
   ]);
+  fs.mkdirSync(pluginData, { recursive: true });
+  fs.writeFileSync(
+    path.join(pluginData, 'settings.json'),
+    `${JSON.stringify({
+      schema: 1,
+      timezone: 'Europe/Berlin',
+      budgets: {
+        daily_eur: 0.001,
+        monthly_eur: 0.002,
+        warning_thresholds_percent: [50, 80, 100],
+      },
+      notifications: { windows: false },
+      hook: { message_format: 'compact' },
+    })}\n`,
+    'utf8',
+  );
 
   const invocation = invoke(rootPath, rootId, rootTurn, false, {
     PLUGIN_DATA: pluginData,
   });
   assert.equal(invocation.status, 0, invocation.stderr);
-  assert.equal(
-    JSON.parse(invocation.stdout).systemMessage,
-    'Usage unavailable — see hook diagnostics.',
+  const message = JSON.parse(invocation.stdout).systemMessage.replaceAll(
+    '\u00a0',
+    ' ',
+  );
+  assert.match(message, /Turn \+ agents ≥110 tok · ≥€0\.00065/);
+  assert.match(
+    message,
+    /Session \+ agents ≥110 tok · ≥€0\.00065 · 1 pending/,
+  );
+  assert.match(
+    message,
+    /Budget: Today ≥65% · ≤€0\.00035 left │ Month ≥33% · ≤€0\.00135 left │ Forecast ≥€0\.00101/,
   );
   assert.match(invocation.stderr, /Malformed token counter/);
 
@@ -593,7 +1243,7 @@ test('treats a malformed token counter as incomplete accounting', () => {
   assert.equal(entries[0].reason, 'history_incomplete');
 });
 
-test('records an exact current turn after an earlier empty task', () => {
+test('records an exact current turn without revisiting an earlier empty task', () => {
   const fixtureRoot = fs.mkdtempSync(
     path.join(os.tmpdir(), 'turn-cost-prior-empty-'),
   );
@@ -639,7 +1289,7 @@ test('records an exact current turn after an earlier empty task', () => {
     ' ',
   );
   assert.match(message, /Turn \+ agents 220 tok · €0\.00124/);
-  assert.match(message, /Session \+ agents unavailable/);
+  assert.match(message, /Session \+ agents 220 tok · €0\.00124/);
   assert.match(message, /Today €0\.00124/);
 
   const entries = readLedgerForRoot(
@@ -698,7 +1348,7 @@ test('records an accounting gap when analysis fails after root identity is known
   assert.equal(entries[0].reason, 'accounting_error');
 });
 
-test('records an unpriced-turn gap and suppresses later partial aggregates', () => {
+test('records an unpriced gap and keeps later aggregates as lower bounds', () => {
   const fixtureRoot = fs.mkdtempSync(
     path.join(os.tmpdir(), 'turn-cost-unpriced-gap-'),
   );
@@ -740,7 +1390,12 @@ test('records an unpriced-turn gap and suppresses later partial aggregates', () 
     ' ',
   );
   assert.match(firstMessage, /Turn \+ agents 110 tok · cost unavailable/);
-  assert.doesNotMatch(firstMessage, /Today|Aug €/);
+  assert.match(
+    firstMessage,
+    /Session \+ agents ≥0 tok · ≥€0\.00000 · 1 pending/,
+  );
+  assert.match(firstMessage, /Today ≥€0\.00000 · 1 pending/);
+  assert.match(firstMessage, /Aug ≥€0\.00000 · 1 pending/);
 
   const usageRoot = path.join(pluginData, 'usage');
   let entries = readLedgerForRoot(usageRoot, '2026-08', rootId);
@@ -770,8 +1425,13 @@ test('records an unpriced-turn gap and suppresses later partial aggregates', () 
     ' ',
   );
   assert.match(secondMessage, /Turn \+ agents 220 tok · €0\.00124/);
-  assert.doesNotMatch(secondMessage, /Today|Aug €/);
-  assert.match(second.stderr, /aggregate totals were suppressed/);
+  assert.match(
+    secondMessage,
+    /Session \+ agents ≥220 tok · ≥€0\.00124 · 1 pending/,
+  );
+  assert.match(secondMessage, /Today ≥€0\.00124 · 1 pending/);
+  assert.match(secondMessage, /Aug ≥€0\.00124 · 1 pending/);
+  assert.match(second.stderr, /exact-known lower bounds/);
 
   entries = readLedgerForRoot(usageRoot, '2026-08', rootId);
   assert.equal(entries.length, 2);

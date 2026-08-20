@@ -319,7 +319,7 @@ test('writes schema-2 records by UTC completion month and is idempotent', (t) =>
   assert.equal(first.recorded, true);
   assert.equal(first.duplicate, false);
   assert.equal(first.conflict, false);
-  assert.match(first.ledgerPath, /usage[\\/]2026-08[\\/]task-[a-f0-9]+\.jsonl$/);
+  assert.match(first.ledgerPath, /usage[\\/]2026-08[\\/]turns\.jsonl$/);
   assert.doesNotMatch(first.ledgerPath, /private/);
 
   const duplicate = runtime.appendLedgerRecord(dataRoot, {
@@ -368,7 +368,7 @@ test('writes metadata-only schema-2 gaps idempotently', (t) => {
   assert.equal(first.duplicate, false);
   assert.equal(first.conflict, false);
   assert.equal(first.resolved, false);
-  assert.match(first.ledgerPath, /usage[\\/]2026-08[\\/]task-[a-f0-9]+\.jsonl$/);
+  assert.match(first.ledgerPath, /usage[\\/]2026-08[\\/]turns\.jsonl$/);
   assert.doesNotMatch(first.ledgerPath, /private/);
 
   const duplicate = runtime.appendLedgerGap(dataRoot, {
@@ -477,7 +477,7 @@ test('a later exact record resolves a gap without rewriting history', (t) => {
   assert.equal(redundant.conflict, false);
 });
 
-test('requires an exact completion timestamp when resolving a gap', (t) => {
+test('resolves a gap by turn identity when completion timestamp changes', (t) => {
   const dataRoot = temporaryData(t);
   const gap = ledgerGap({
     root_thread_id: 'strict-retry-root',
@@ -493,17 +493,17 @@ test('requires an exact completion timestamp when resolving a gap', (t) => {
     }),
   );
 
-  assert.equal(retry.recorded, false);
-  assert.equal(retry.conflict, true);
-  assert.equal(retry.resolvedGap, false);
+  assert.equal(retry.recorded, true);
+  assert.equal(retry.conflict, false);
+  assert.equal(retry.resolvedGap, true);
   assert.equal(
     fs
       .readFileSync(first.ledgerPath, 'utf8')
       .split(/\r?\n/)
       .filter(Boolean).length,
-    1,
+    2,
   );
-  assert.equal(runtime.readLedger(dataRoot).gaps.length, 1);
+  assert.equal(runtime.readLedger(dataRoot).gaps.length, 0);
 });
 
 test('rebuckets gap relevance by configured timezone and seven-day window', (t) => {
@@ -612,70 +612,57 @@ test('scopes hook snapshots to nearby UTC months while full-history dashboards s
   assert.deepEqual(full.opened, [oldPath]);
 });
 
-test('persists bounded month warming across snapshots while exact turns remain appendable', (t) => {
+test('reads a canonical monthly ledger within a one-file snapshot budget', (t) => {
   const dataRoot = temporaryData(t);
+  const records = [];
   for (let index = 0; index < 3; index += 1) {
-    const record = runtime.normalizeLedgerRecord(
+    records.push(runtime.normalizeLedgerRecord(
       ledgerRecord({
         root_thread_id: `warming-root-${index}`,
         turn_id: `warming-turn-${index}`,
       }),
-    );
-    const filePath = runtime.ledgerPathFor(dataRoot, record);
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(
-      filePath,
-      `${JSON.stringify(record)}\n`,
-      'utf8',
-    );
+    ));
   }
+  const filePath = runtime.ledgerPathFor(dataRoot, records[0]);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(
+    filePath,
+    `${records.map((record) => JSON.stringify(record)).join('\n')}\n`,
+    'utf8',
+  );
 
   const snapshotOptions = {
     now: '2026-08-20T13:00:00.000Z',
     maxLedgerFilesPerMonth: 1,
   };
   const first = runtime.buildSnapshot(dataRoot, snapshotOptions);
-  assert.equal(first.complete, false);
-  assert.match(first.diagnostics.join('\n'), /cache is warming/i);
+  assert.equal(first.complete, true);
+  assert.equal(first.records_count, 3);
+  assert.doesNotMatch(first.diagnostics.join('\n'), /cache is warming/i);
 
   const cachePath = path.join(
     dataRoot,
     'cache',
-    'ledger-read-v3.json.gz',
+    'ledger-read-v4.json.gz',
   );
-  const readPendingCount = () => {
-    const cache = JSON.parse(
-      zlib.gunzipSync(fs.readFileSync(cachePath)),
-    );
-    return cache.directories.find(
-      (directory) => directory.month === '2026-08',
-    ).pending_files.length;
-  };
-  assert.equal(readPendingCount(), 2);
+  const cache = JSON.parse(
+    zlib.gunzipSync(fs.readFileSync(cachePath)),
+  );
+  assert.equal(cache.files.length, 1);
+  assert.equal(cache.files[0].relative_path, '2026-08/turns.jsonl');
+  assert.deepEqual(cache.directories[0].pending_files, []);
 
-  let snapshot = first;
-  for (let pass = 0; pass < 2; pass += 1) {
-    const runtimeModulePath = require.resolve(
-      '../plugins/codex-cost-meter/lib/runtime-data',
-    );
-    delete require.cache[runtimeModulePath];
-    const freshRuntime = require(runtimeModulePath);
-    const appended = freshRuntime.appendLedgerRecord(
-      dataRoot,
-      ledgerRecord({
-        root_thread_id: `warming-new-root-${pass}`,
-        turn_id: `warming-new-turn-${pass}`,
-      }),
-    );
-    assert.equal(appended.recorded, true);
-    assert.equal(readPendingCount(), 2 - pass);
-    snapshot = freshRuntime.buildSnapshot(dataRoot, snapshotOptions);
-    assert.equal(readPendingCount(), 1 - pass);
-  }
-
+  const appended = runtime.appendLedgerRecord(
+    dataRoot,
+    ledgerRecord({
+      root_thread_id: 'warming-new-root',
+      turn_id: 'warming-new-turn',
+    }),
+  );
+  assert.equal(appended.recorded, true);
+  const snapshot = runtime.buildSnapshot(dataRoot, snapshotOptions);
   assert.equal(snapshot.complete, true);
-  assert.equal(snapshot.records_count, 5);
-  assert.equal(readPendingCount(), 0);
+  assert.equal(snapshot.records_count, 4);
 });
 
 test('buckets records across Berlin day, month, and DST boundaries', (t) => {
@@ -1022,7 +1009,7 @@ test('keeps forks separate when they retain the source session id', (t) => {
   );
 });
 
-test('incremental ledger cache skips unchanged files and detects appends, additions, and deletions', (t) => {
+test('incremental ledger cache skips unchanged monthly files and detects appends and deletion', (t) => {
   const dataRoot = temporaryData(t);
   const first = runtime.appendLedgerRecord(
     dataRoot,
@@ -1036,7 +1023,7 @@ test('incremental ledger cache skips unchanged files and detects appends, additi
   const cachePath = path.join(
     dataRoot,
     'cache',
-    'ledger-read-v3.json.gz',
+    'ledger-read-v4.json.gz',
   );
   if (process.platform !== 'win32' && (fs.statSync(dataRoot).mode & 0o777) !== 0o777) {
     assert.equal(fs.statSync(cachePath).mode & 0o777, 0o600);
@@ -1087,6 +1074,7 @@ test('incremental ledger cache skips unchanged files and detects appends, additi
   );
   assert.equal(addedResult.recorded, true);
   const addedPath = addedResult.ledgerPath;
+  assert.equal(addedPath, first.ledgerPath);
   const added = trackLedgerReads(() => runtime.readLedger(dataRoot));
   assert.equal(added.value.records.length, 3);
   assert.deepEqual(added.opened, []);
@@ -1094,11 +1082,8 @@ test('incremental ledger cache skips unchanged files and detects appends, additi
   fs.unlinkSync(first.ledgerPath);
   const deleted = trackLedgerReads(() => runtime.readLedger(dataRoot));
   assert.equal(deleted.value.complete, true);
-  assert.deepEqual(
-    deleted.value.records.map((record) => record.turn_id),
-    ['new-file-turn'],
-  );
-  assert.deepEqual(deleted.opened, [addedPath]);
+  assert.deepEqual(deleted.value.records, []);
+  assert.deepEqual(deleted.opened, []);
 });
 
 test('requires the generation marker for external in-place ledger appends', (t) => {
@@ -1186,7 +1171,7 @@ test('uses pre/post generation epochs so an interleaved reader cannot leave a st
   assert.equal(runtime.readLedger(dataRoot).records.length, 3);
 });
 
-test('waits beyond one second for a concurrent ledger writer', (t) => {
+test('waits beyond one second for a concurrent ledger writer', async (t) => {
   const dataRoot = temporaryData(t);
   const lockDirectory = path.join(dataRoot, 'usage', '.locks');
   const lockPath = path.join(lockDirectory, '.ledger-write.lock');
@@ -1201,29 +1186,36 @@ test('waits beyond one second for a concurrent ledger writer', (t) => {
         "const descriptor=fs.openSync(file,'wx',0o600);",
         "fs.writeFileSync(descriptor,`${process.pid}\\n`);",
         'fs.closeSync(descriptor);',
-        'setTimeout(()=>fs.unlinkSync(file),1400);',
+        'process.send("locked");',
+        'process.on("message",(message)=>{',
+        'if(message==="release"){',
+        'setTimeout(()=>{fs.unlinkSync(file);process.exit(0);},1400);',
+        '}',
+        '});',
       ].join(''),
       lockPath,
     ],
-    { stdio: 'ignore' },
+    { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] },
   );
   t.after(() => child.kill());
 
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    if (fs.existsSync(lockPath)) {
-      break;
-    }
-    waitMilliseconds(10);
-  }
+  await new Promise((resolve, reject) => {
+    child.once('message', resolve);
+    child.once('error', reject);
+    child.once('exit', (code) => {
+      reject(new Error(`Ledger-lock child exited early with code ${code}.`));
+    });
+  });
   assert.equal(fs.existsSync(lockPath), true);
 
-  const started = Date.now();
+  const started = process.hrtime.bigint();
+  child.send('release');
   const appended = runtime.appendLedgerRecord(
     dataRoot,
     ledgerRecord({ turn_id: 'after-contention' }),
   );
   assert.equal(appended.recorded, true);
-  assert.ok(Date.now() - started >= 1_000);
+  assert.ok(process.hrtime.bigint() - started >= 1_000_000_000n);
 });
 
 test('retries a transient permission error while acquiring a ledger lock', (t) => {
@@ -1269,7 +1261,7 @@ test('rebuilds a corrupt ledger cache and detects source-file replacement', (t) 
   const cachePath = path.join(
     dataRoot,
     'cache',
-    'ledger-read-v3.json.gz',
+    'ledger-read-v4.json.gz',
   );
   fs.writeFileSync(cachePath, '{"schema":1,"broken":', 'utf8');
   const rebuilt = trackLedgerReads(() => runtime.readLedger(dataRoot));
@@ -1466,4 +1458,834 @@ test('adds a separator after a valid unterminated JSONL record', (t) => {
   assert.equal(lines.length, 2);
   assert.equal(JSON.parse(lines[0]).turn_id, 'unterminated-valid-first');
   assert.equal(JSON.parse(lines[1]).turn_id, 'second-after-unterminated');
+});
+
+test('builds compact lower-bound hook rollups and resolves gaps incrementally', (t) => {
+  const dataRoot = temporaryData(t);
+  const rootRecord = ledgerRecord({
+    root_thread_id: 'rollup-root',
+    session_id: 'rollup-session',
+    turn_id: 'rollup-exact',
+    cost_eur_nanos: 10,
+  });
+  runtime.appendLedgerRecord(dataRoot, rootRecord, {
+    rollupNow: '2026-08-20T12:01:00.000Z',
+  });
+  runtime.appendLedgerGap(
+    dataRoot,
+    ledgerGap({
+      root_thread_id: 'rollup-root',
+      turn_id: 'rollup-pending',
+      completed_at: '2026-08-20T13:00:00.000Z',
+    }),
+    { rollupNow: '2026-08-20T13:01:00.000Z' },
+  );
+  runtime.appendLedgerRecord(
+    dataRoot,
+    ledgerRecord({
+      root_thread_id: 'other-rollup-root',
+      session_id: 'other-rollup-session',
+      turn_id: 'other-rollup-exact',
+      completed_at: '2026-08-20T14:00:00.000Z',
+      cost_eur_nanos: 20,
+    }),
+    { rollupNow: '2026-08-20T14:01:00.000Z' },
+  );
+
+  const cached = trackLedgerReads(() =>
+    runtime.buildHookRollup(dataRoot, {
+      rootThreadId: 'rollup-root',
+      now: '2026-08-20T15:00:00.000Z',
+    }),
+  );
+  assert.deepEqual(cached.opened, []);
+  assert.equal(cached.value.complete, false);
+  assert.equal(cached.value.pending_turns, 1);
+  assert.equal(cached.value.today.cost_eur_nanos, 30);
+  assert.equal(cached.value.today.turns, 2);
+  assert.equal(cached.value.today.pending_turns, 1);
+  assert.equal(cached.value.month.cost_eur_nanos, 30);
+  assert.equal(cached.value.month.pending_turns, 1);
+  assert.equal(cached.value.session.cost_eur_nanos, 10);
+  assert.equal(cached.value.session.turns, 1);
+  assert.equal(cached.value.session.pending_turns, 1);
+  assert.match(cached.value.diagnostics.join('\n'), /lower bounds/i);
+
+  runtime.appendLedgerRecord(
+    dataRoot,
+    ledgerRecord({
+      root_thread_id: 'rollup-root',
+      session_id: 'rollup-session',
+      turn_id: 'rollup-pending',
+      completed_at: '2026-08-20T13:00:00.000Z',
+      cost_eur_nanos: 40,
+    }),
+    { rollupNow: '2026-08-20T15:01:00.000Z' },
+  );
+  const resolved = runtime.buildHookRollup(dataRoot, {
+    rootThreadId: 'rollup-root',
+    now: '2026-08-20T15:02:00.000Z',
+  });
+  assert.equal(resolved.complete, true);
+  assert.equal(resolved.pending_turns, 0);
+  assert.equal(resolved.today.cost_eur_nanos, 70);
+  assert.equal(resolved.today.turns, 3);
+  assert.equal(resolved.session.cost_eur_nanos, 50);
+  assert.equal(resolved.session.turns, 2);
+  assert.deepEqual(resolved.session.usage, addUsage(
+    rootRecord.usage,
+    rootRecord.usage,
+  ));
+
+  const cacheText = fs.readFileSync(
+    runtime.hookRollupCachePath(dataRoot),
+    'utf8',
+  );
+  assert.doesNotMatch(cacheText, /rollup-root|rollup-session|rollup-pending/);
+});
+
+test('keeps known gap summaries monotonic through rebuild and resolution', (t) => {
+  const dataRoot = temporaryData(t);
+  const knownUsage = usage(30, 10, 5, 6, 2);
+  const pending = ledgerGap({
+    root_thread_id: 'known-gap-root',
+    turn_id: 'known-gap-turn',
+    known_usage: knownUsage,
+    known_cost_usd_nanos: 40,
+    known_cost_eur_nanos: 30,
+  });
+  const appendedGap = runtime.appendLedgerGap(dataRoot, pending, {
+    rollupNow: '2026-08-20T12:01:00.000Z',
+  });
+  assert.equal(appendedGap.recorded, true);
+  assert.deepEqual(appendedGap.gap.known_usage, knownUsage);
+
+  const provisional = runtime.buildHookRollup(dataRoot, {
+    rootThreadId: 'known-gap-root',
+    now: '2026-08-20T13:00:00.000Z',
+  });
+  assert.equal(provisional.complete, false);
+  assert.equal(provisional.pending_turns, 1);
+  assert.equal(provisional.today.cost_eur_nanos, 30);
+  assert.equal(provisional.today.turns, 0);
+  assert.deepEqual(provisional.today.usage, knownUsage);
+  assert.equal(provisional.session.cost_eur_nanos, 30);
+  assert.equal(provisional.session.turns, 0);
+
+  fs.unlinkSync(runtime.hookRollupCachePath(dataRoot));
+  const rebuilt = runtime.buildHookRollup(dataRoot, {
+    rootThreadId: 'known-gap-root',
+    now: '2026-08-20T13:01:00.000Z',
+  });
+  assert.equal(rebuilt.today.cost_eur_nanos, 30);
+  assert.deepEqual(rebuilt.today.usage, knownUsage);
+  assert.equal(rebuilt.pending_turns, 1);
+
+  runtime.appendLedgerRecord(
+    dataRoot,
+    ledgerRecord({
+      root_thread_id: 'known-gap-other-root',
+      turn_id: 'known-gap-other-turn',
+      cost_usd_nanos: 5,
+      cost_eur_nanos: 5,
+    }),
+    { rollupNow: '2026-08-20T13:02:00.000Z' },
+  );
+  const afterOtherTurn = runtime.buildHookRollup(dataRoot, {
+    rootThreadId: 'known-gap-root',
+    now: '2026-08-20T13:03:00.000Z',
+  });
+  assert.equal(afterOtherTurn.today.cost_eur_nanos, 35);
+  assert.equal(afterOtherTurn.session.cost_eur_nanos, 30);
+  assert.equal(afterOtherTurn.pending_turns, 1);
+
+  const exactUsage = usage(50, 20, 5, 10, 3);
+  const resolved = runtime.appendLedgerRecord(
+    dataRoot,
+    ledgerRecord({
+      root_thread_id: 'known-gap-root',
+      turn_id: 'known-gap-turn',
+      usage: exactUsage,
+      cost_usd_nanos: 60,
+      cost_eur_nanos: 50,
+      model_breakdown: [
+        {
+          model: 'gpt-test',
+          usage: exactUsage,
+          cost_usd_nanos: 60,
+          cost_eur_nanos: 50,
+        },
+      ],
+      agent_breakdown: {
+        root: {
+          usage: exactUsage,
+          cost_usd_nanos: 60,
+          cost_eur_nanos: 50,
+        },
+        subagents: {
+          usage: usage(0),
+          cost_usd_nanos: 0,
+          cost_eur_nanos: 0,
+          thread_count: 0,
+        },
+      },
+    }),
+    { rollupNow: '2026-08-20T13:04:00.000Z' },
+  );
+  assert.equal(resolved.recorded, true);
+  assert.equal(resolved.resolvedGap, true);
+
+  const exact = runtime.buildHookRollup(dataRoot, {
+    rootThreadId: 'known-gap-root',
+    now: '2026-08-20T13:05:00.000Z',
+  });
+  assert.equal(exact.complete, true);
+  assert.equal(exact.pending_turns, 0);
+  assert.equal(exact.today.cost_eur_nanos, 55);
+  assert.equal(exact.today.turns, 2);
+  assert.equal(exact.session.cost_eur_nanos, 50);
+  assert.equal(exact.session.turns, 1);
+  assert.deepEqual(exact.session.usage, exactUsage);
+  const stored = JSON.parse(
+    fs.readFileSync(runtime.hookRollupCachePath(dataRoot), 'utf8'),
+  );
+  assert.deepEqual(stored.payload.unresolved_gaps, {});
+});
+
+test('rebuckets a known gap when exact completion crosses Berlin midnight', (t) => {
+  const dataRoot = temporaryData(t);
+  const knownUsage = usage(30, 10, 5, 6, 2);
+  runtime.appendLedgerGap(
+    dataRoot,
+    ledgerGap({
+      root_thread_id: 'midnight-gap-root',
+      turn_id: 'midnight-gap-turn',
+      completed_at: '2026-08-31T21:59:59.000Z',
+      known_usage: knownUsage,
+      known_cost_usd_nanos: 40,
+      known_cost_eur_nanos: 30,
+    }),
+    { rollupNow: '2026-08-31T21:59:59.000Z' },
+  );
+  const august = runtime.buildHookRollup(dataRoot, {
+    rootThreadId: 'midnight-gap-root',
+    now: '2026-08-31T21:59:59.000Z',
+  });
+  assert.equal(august.today.date, '2026-08-31');
+  assert.equal(august.today.cost_eur_nanos, 30);
+  assert.equal(august.month.month, '2026-08');
+  assert.equal(august.month.cost_eur_nanos, 30);
+  assert.equal(august.pending_turns, 1);
+
+  const exactUsage = usage(50, 20, 5, 10, 3);
+  const resolved = runtime.appendLedgerRecord(
+    dataRoot,
+    ledgerRecord({
+      root_thread_id: 'midnight-gap-root',
+      turn_id: 'midnight-gap-turn',
+      completed_at: '2026-08-31T22:00:00.000Z',
+      usage: exactUsage,
+      cost_usd_nanos: 60,
+      cost_eur_nanos: 50,
+      model_breakdown: [
+        {
+          model: 'gpt-test',
+          usage: exactUsage,
+          cost_usd_nanos: 60,
+          cost_eur_nanos: 50,
+        },
+      ],
+      agent_breakdown: {
+        root: {
+          usage: exactUsage,
+          cost_usd_nanos: 60,
+          cost_eur_nanos: 50,
+        },
+        subagents: {
+          usage: usage(0),
+          cost_usd_nanos: 0,
+          cost_eur_nanos: 0,
+          thread_count: 0,
+        },
+      },
+    }),
+    { rollupNow: '2026-08-31T22:00:00.000Z' },
+  );
+  assert.equal(resolved.recorded, true);
+  assert.equal(resolved.resolvedGap, true);
+
+  const september = runtime.buildHookRollup(dataRoot, {
+    rootThreadId: 'midnight-gap-root',
+    now: '2026-08-31T22:01:00.000Z',
+  });
+  assert.equal(september.complete, true);
+  assert.equal(september.pending_turns, 0);
+  assert.equal(september.today.date, '2026-09-01');
+  assert.equal(september.today.cost_eur_nanos, 50);
+  assert.equal(september.today.turns, 1);
+  assert.equal(september.month.month, '2026-09');
+  assert.equal(september.month.cost_eur_nanos, 50);
+  assert.equal(september.session.cost_eur_nanos, 50);
+  assert.deepEqual(september.session.usage, exactUsage);
+
+  const stored = JSON.parse(
+    fs.readFileSync(runtime.hookRollupCachePath(dataRoot), 'utf8'),
+  );
+  assert.equal(stored.payload.days['2026-08-31'].cost_eur_nanos, 0);
+  assert.equal(stored.payload.days['2026-08-31'].pending_turns, 0);
+  assert.equal(stored.payload.months['2026-08'].cost_eur_nanos, 0);
+  assert.deepEqual(runtime.readLedger(dataRoot).gaps, []);
+});
+
+test('validates known gap summaries and rejects lower bounds above exact records', (t) => {
+  const dataRoot = temporaryData(t);
+  assert.throws(
+    () =>
+      runtime.appendLedgerGap(
+        dataRoot,
+        ledgerGap({
+          turn_id: 'partial-known-gap',
+          known_usage: usage(1),
+        }),
+      ),
+    /must be provided together/i,
+  );
+
+  const knownUsage = usage(100, 40, 10, 20, 5);
+  runtime.appendLedgerGap(
+    dataRoot,
+    ledgerGap({
+      root_thread_id: 'excess-known-root',
+      turn_id: 'excess-known-turn',
+      known_usage: knownUsage,
+      known_cost_usd_nanos: 100,
+      known_cost_eur_nanos: 100,
+    }),
+  );
+  const conflict = runtime.appendLedgerRecord(
+    dataRoot,
+    ledgerRecord({
+      root_thread_id: 'excess-known-root',
+      turn_id: 'excess-known-turn',
+      cost_usd_nanos: 99,
+      cost_eur_nanos: 99,
+    }),
+  );
+  assert.equal(conflict.recorded, false);
+  assert.equal(conflict.conflict, true);
+  assert.match(conflict.diagnostics.join('\n'), /below.*lower bound/i);
+
+  const rollup = runtime.buildHookRollup(dataRoot, {
+    rootThreadId: 'excess-known-root',
+    now: '2026-08-20T13:00:00.000Z',
+  });
+  assert.equal(rollup.pending_turns, 1);
+  assert.equal(rollup.session.cost_eur_nanos, 100);
+  assert.deepEqual(rollup.session.usage, knownUsage);
+  assert.equal(rollup.session.turns, 0);
+});
+
+test('seals Berlin days and rebuckets a compact rollup after timezone changes', (t) => {
+  const dataRoot = temporaryData(t);
+  runtime.appendLedgerRecord(
+    dataRoot,
+    ledgerRecord({
+      root_thread_id: 'boundary-root',
+      turn_id: 'before-berlin-midnight',
+      completed_at: '2026-08-31T21:59:59.000Z',
+      cost_eur_nanos: 10,
+    }),
+    { rollupNow: '2026-08-31T21:59:59.000Z' },
+  );
+  runtime.appendLedgerRecord(
+    dataRoot,
+    ledgerRecord({
+      root_thread_id: 'boundary-root',
+      turn_id: 'after-berlin-midnight',
+      completed_at: '2026-08-31T22:00:00.000Z',
+      cost_eur_nanos: 20,
+    }),
+    { rollupNow: '2026-08-31T22:00:00.000Z' },
+  );
+
+  const berlin = runtime.buildHookRollup(dataRoot, {
+    rootThreadId: 'boundary-root',
+    now: '2026-08-31T22:30:00.000Z',
+  });
+  assert.equal(berlin.timezone, 'Europe/Berlin');
+  assert.equal(berlin.today.date, '2026-09-01');
+  assert.equal(berlin.today.cost_eur_nanos, 20);
+  assert.equal(berlin.month.month, '2026-09');
+  assert.equal(berlin.month.cost_eur_nanos, 20);
+  assert.equal(berlin.session.cost_eur_nanos, 30);
+
+  let stored = JSON.parse(
+    fs.readFileSync(runtime.hookRollupCachePath(dataRoot), 'utf8'),
+  );
+  assert.equal(stored.payload.active_date, '2026-09-01');
+  assert.equal(stored.payload.sealed_through, '2026-08-31');
+
+  const utcSettings = {
+    ...runtime.defaultSettings(),
+    timezone: 'UTC',
+  };
+  const utc = runtime.buildHookRollup(dataRoot, {
+    rootThreadId: 'boundary-root',
+    now: '2026-08-31T22:30:00.000Z',
+    settings: utcSettings,
+  });
+  assert.equal(utc.timezone, 'UTC');
+  assert.equal(utc.today.date, '2026-08-31');
+  assert.equal(utc.today.cost_eur_nanos, 30);
+  assert.equal(utc.month.month, '2026-08');
+  assert.equal(utc.month.cost_eur_nanos, 30);
+  stored = JSON.parse(
+    fs.readFileSync(runtime.hookRollupCachePath(dataRoot), 'utf8'),
+  );
+  assert.equal(stored.payload.timezone, 'UTC');
+});
+
+test('validates and deterministically rebuilds the compact hook rollup cache', (t) => {
+  const dataRoot = temporaryData(t);
+  const first = runtime.appendLedgerRecord(
+    dataRoot,
+    ledgerRecord({
+      root_thread_id: 'rebuild-rollup-root',
+      turn_id: 'rebuild-rollup-one',
+      cost_eur_nanos: 11,
+    }),
+  );
+  const cachePath = runtime.hookRollupCachePath(dataRoot);
+  const corrupt = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+  corrupt.payload.months['2026-08'].cost_eur_nanos = 999;
+  fs.writeFileSync(cachePath, JSON.stringify(corrupt), 'utf8');
+
+  const rebuilt = runtime.buildHookRollup(dataRoot, {
+    rootThreadId: 'rebuild-rollup-root',
+    now: '2026-08-20T13:00:00.000Z',
+  });
+  assert.equal(rebuilt.month.cost_eur_nanos, 11);
+  assert.match(rebuilt.diagnostics.join('\n'), /checksum/i);
+
+  const external = runtime.normalizeLedgerRecord(
+    ledgerRecord({
+      root_thread_id: 'rebuild-rollup-root',
+      turn_id: 'rebuild-rollup-two',
+      cost_eur_nanos: 13,
+    }),
+  );
+  fs.appendFileSync(
+    first.ledgerPath,
+    `${JSON.stringify(external)}\n`,
+    'utf8',
+  );
+  markLedgerChanged(first.ledgerPath);
+  const sourceRebuilt = runtime.buildHookRollup(dataRoot, {
+    rootThreadId: 'rebuild-rollup-root',
+    now: '2026-08-20T13:01:00.000Z',
+  });
+  assert.equal(sourceRebuilt.month.cost_eur_nanos, 24);
+  assert.equal(sourceRebuilt.session.turns, 2);
+
+  const deterministic = fs.readFileSync(cachePath, 'utf8');
+  fs.unlinkSync(cachePath);
+  runtime.buildHookRollup(dataRoot, {
+    rootThreadId: 'rebuild-rollup-root',
+    now: '2026-08-20T13:01:00.000Z',
+  });
+  assert.equal(fs.readFileSync(cachePath, 'utf8'), deterministic);
+});
+
+test('cold hook rollup reads one monthly source for 1000 sessions', (t) => {
+  const dataRoot = temporaryData(t);
+  const lines = [];
+  for (let session = 0; session < 1_000; session += 1) {
+    for (let turn = 0; turn < 10; turn += 1) {
+      lines.push(JSON.stringify(runtime.normalizeLedgerRecord(
+        ledgerRecord({
+          root_thread_id: `cold-rollup-root-${session}`,
+          session_id: `cold-rollup-session-${session}`,
+          turn_id: `cold-rollup-turn-${session}-${turn}`,
+        }),
+      )));
+    }
+  }
+  const filePath = runtime.ledgerPathFor(
+    dataRoot,
+    ledgerRecord(),
+  );
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, `${lines.join('\n')}\n`, 'utf8');
+
+  const started = process.hrtime.bigint();
+  const cold = trackLedgerReads(() =>
+    runtime.buildHookRollup(dataRoot, {
+      rootThreadId: 'cold-rollup-root-999',
+      now: '2026-08-20T13:00:00.000Z',
+    }),
+  );
+  const elapsed =
+    Number(process.hrtime.bigint() - started) / 1_000_000;
+  assert.deepEqual(cold.opened, [filePath]);
+  assert.equal(cold.value.complete, true);
+  assert.equal(cold.value.pending_turns, 0);
+  assert.equal(cold.value.today.turns, 10_000);
+  assert.equal(cold.value.month.turns, 10_000);
+  assert.equal(cold.value.session.turns, 10);
+  assert.doesNotMatch(cold.value.diagnostics.join('\n'), /warming/i);
+  assert.ok(
+    elapsed < 12_000,
+    `Cold monthly rollup took ${elapsed.toFixed(1)} ms.`,
+  );
+
+  const ledgerCache = JSON.parse(
+    zlib.gunzipSync(
+      fs.readFileSync(
+        path.join(dataRoot, 'cache', 'ledger-read-v4.json.gz'),
+      ),
+    ),
+  );
+  assert.equal(ledgerCache.files.length, 1);
+  assert.equal(
+    ledgerCache.files[0].relative_path,
+    '2026-08/turns.jsonl',
+  );
+  assert.equal(ledgerCache.directories[0].complete, true);
+  assert.deepEqual(ledgerCache.directories[0].pending_files, []);
+});
+
+test('old unrelated ledger conflict does not poison current hook scopes', (t) => {
+  const dataRoot = temporaryData(t);
+  const old = runtime.normalizeLedgerRecord(
+    ledgerRecord({
+      root_thread_id: 'old-corrupt-root',
+      turn_id: 'old-corrupt-turn',
+      completed_at: '2025-01-15T12:00:00.000Z',
+      cost_eur_nanos: 7,
+    }),
+  );
+  const currentRecord = runtime.normalizeLedgerRecord(
+    ledgerRecord({
+      root_thread_id: 'current-clean-root',
+      turn_id: 'current-clean-turn',
+      completed_at: '2026-08-20T12:00:00.000Z',
+      cost_eur_nanos: 11,
+    }),
+  );
+  const oldPath = runtime.ledgerPathFor(dataRoot, old);
+  const currentPath = runtime.ledgerPathFor(dataRoot, currentRecord);
+  fs.mkdirSync(path.dirname(oldPath), { recursive: true });
+  fs.mkdirSync(path.dirname(currentPath), { recursive: true });
+  fs.writeFileSync(
+    oldPath,
+    `${JSON.stringify(old)}\n${JSON.stringify({
+      ...old,
+      written_at: '2025-01-15T12:02:00.000Z',
+      cost_eur_nanos: 8,
+    })}\n`,
+    'utf8',
+  );
+  fs.writeFileSync(
+    currentPath,
+    `${JSON.stringify(currentRecord)}\n`,
+    'utf8',
+  );
+
+  const current = runtime.buildHookRollup(dataRoot, {
+    rootThreadId: 'current-clean-root',
+    now: '2026-08-20T13:00:00.000Z',
+  });
+  assert.equal(current.complete, true);
+  assert.equal(current.today.complete, true);
+  assert.equal(current.month.complete, true);
+  assert.equal(current.session.complete, true);
+  assert.equal(current.today.cost_eur_nanos, 11);
+  assert.equal(current.month.cost_eur_nanos, 11);
+  assert.equal(current.session.cost_eur_nanos, 11);
+  assert.doesNotMatch(current.diagnostics.join('\n'), /conflicting/i);
+
+  const affectedSession = runtime.buildHookRollup(dataRoot, {
+    rootThreadId: 'old-corrupt-root',
+    now: '2026-08-20T13:00:00.000Z',
+  });
+  assert.equal(affectedSession.today.complete, true);
+  assert.equal(affectedSession.month.complete, true);
+  assert.equal(affectedSession.session.complete, false);
+  assert.equal(affectedSession.complete, false);
+  assert.match(affectedSession.diagnostics.join('\n'), /conflicting/i);
+});
+
+test('ignores noncanonical JSONL files in usage month directories', (t) => {
+  const dataRoot = temporaryData(t);
+  const current = runtime.appendLedgerRecord(
+    dataRoot,
+    ledgerRecord({
+      root_thread_id: 'unexpected-file-root',
+      turn_id: 'unexpected-file-turn',
+      cost_eur_nanos: 11,
+    }),
+  );
+  const unexpectedPath = path.join(
+    path.dirname(current.ledgerPath),
+    'unexpected.jsonl',
+  );
+  fs.writeFileSync(unexpectedPath, '{invalid json\n', 'utf8');
+  const legacyTaskPath = path.join(
+    path.dirname(current.ledgerPath),
+    'task-aaaaaaaaaaaaaaaaaaaaaaaa.jsonl',
+  );
+  fs.writeFileSync(
+    legacyTaskPath,
+    `${JSON.stringify(runtime.normalizeLedgerRecord(
+      ledgerRecord({
+        root_thread_id: 'legacy-task-root',
+        turn_id: 'legacy-task-turn',
+        cost_eur_nanos: 999,
+      }),
+    ))}\n`,
+    'utf8',
+  );
+  markLedgerChanged(unexpectedPath);
+
+  const first = runtime.buildHookRollup(dataRoot, {
+    rootThreadId: 'unexpected-file-root',
+    now: '2026-08-20T13:00:00.000Z',
+  });
+  assert.equal(first.complete, true);
+  assert.equal(first.today.complete, true);
+  assert.equal(first.month.complete, true);
+  assert.equal(first.session.complete, true);
+  assert.equal(first.today.cost_eur_nanos, 11);
+  assert.equal(first.today.turns, 1);
+  assert.doesNotMatch(first.diagnostics.join('\n'), /invalid JSON/i);
+
+  const cached = trackLedgerReads(() =>
+    runtime.buildHookRollup(dataRoot, {
+      rootThreadId: 'unexpected-file-root',
+      now: '2026-08-20T13:01:00.000Z',
+    }),
+  );
+  assert.deepEqual(cached.opened, []);
+  assert.equal(cached.value.complete, true);
+  const stored = JSON.parse(
+    fs.readFileSync(runtime.hookRollupCachePath(dataRoot), 'utf8'),
+  );
+  assert.deepEqual(
+    stored.payload.issues.map((issue) => ({
+      kind: issue.kind,
+      utc_month: issue.utc_month,
+      task_key: issue.task_key,
+    })),
+    [],
+  );
+});
+
+test('never enumerates a month containing thousands of legacy task files', (t) => {
+  const dataRoot = temporaryData(t);
+  const firstRecord = runtime.normalizeLedgerRecord(
+    ledgerRecord({
+      root_thread_id: 'large-legacy-root',
+      turn_id: 'large-legacy-first',
+      cost_eur_nanos: 11,
+    }),
+  );
+  const ledgerPath = runtime.ledgerPathFor(dataRoot, firstRecord);
+  const monthDirectory = path.dirname(ledgerPath);
+  fs.mkdirSync(monthDirectory, { recursive: true });
+  fs.writeFileSync(
+    ledgerPath,
+    `${JSON.stringify(firstRecord)}\n`,
+    'utf8',
+  );
+
+  const originalReaddirSync = fs.readdirSync;
+  const virtualLegacyNames = Array.from(
+    { length: 5_000 },
+    (_, index) => `task-${String(index).padStart(24, '0')}.jsonl`,
+  );
+  let monthDirectoryReads = 0;
+  fs.readdirSync = function readdirSyncWithoutMonthEnumeration(
+    directoryPath,
+    options,
+  ) {
+    const result = originalReaddirSync.call(
+      fs,
+      directoryPath,
+      options,
+    );
+    if (path.resolve(directoryPath) !== path.resolve(monthDirectory)) {
+      return result;
+    }
+    monthDirectoryReads += 1;
+    if (options?.withFileTypes) {
+      return [
+        ...result,
+        ...virtualLegacyNames.map((name) => ({
+          name,
+          isFile: () => true,
+          isDirectory: () => false,
+        })),
+      ];
+    }
+    return [...result, ...virtualLegacyNames];
+  };
+  t.after(() => {
+    fs.readdirSync = originalReaddirSync;
+  });
+
+  const cold = runtime.buildHookRollup(dataRoot, {
+    rootThreadId: 'large-legacy-root',
+    now: '2026-08-20T13:00:00.000Z',
+  });
+  assert.equal(cold.complete, true);
+  assert.equal(cold.session.cost_eur_nanos, 11);
+
+  fs.rmSync(path.join(dataRoot, 'cache'), {
+    recursive: true,
+    force: true,
+  });
+  const appended = runtime.appendLedgerRecord(
+    dataRoot,
+    ledgerRecord({
+      root_thread_id: 'large-legacy-root',
+      turn_id: 'large-legacy-second',
+      cost_eur_nanos: 13,
+    }),
+  );
+  assert.equal(appended.recorded, true);
+  assert.equal(monthDirectoryReads, 0);
+  assert.equal(
+    runtime.buildHookRollup(dataRoot, {
+      rootThreadId: 'large-legacy-root',
+      now: '2026-08-20T13:01:00.000Z',
+    }).session.cost_eur_nanos,
+    24,
+  );
+});
+
+test('revalidates issue-bearing hook rollups after transient read failures', (t) => {
+  const dataRoot = temporaryData(t);
+  const record = runtime.normalizeLedgerRecord(
+    ledgerRecord({
+      root_thread_id: 'transient-rollup-root',
+      turn_id: 'transient-rollup-turn',
+      cost_eur_nanos: 17,
+    }),
+  );
+  const ledgerPath = runtime.ledgerPathFor(dataRoot, record);
+  fs.mkdirSync(path.dirname(ledgerPath), { recursive: true });
+  fs.writeFileSync(
+    ledgerPath,
+    `${JSON.stringify(record)}\n`,
+    'utf8',
+  );
+
+  const originalOpenSync = fs.openSync;
+  let injected = false;
+  fs.openSync = function openSyncWithTransientReadError(
+    filePath,
+    flags,
+    mode,
+  ) {
+    if (!injected && filePath === ledgerPath && flags === 'r') {
+      injected = true;
+      const error = new Error('transient Windows read failure');
+      error.code = 'EPERM';
+      throw error;
+    }
+    return originalOpenSync.call(fs, filePath, flags, mode);
+  };
+  t.after(() => {
+    fs.openSync = originalOpenSync;
+  });
+
+  const failed = runtime.buildHookRollup(dataRoot, {
+    rootThreadId: 'transient-rollup-root',
+    now: '2026-08-20T13:00:00.000Z',
+  });
+  assert.equal(injected, true);
+  assert.equal(failed.complete, false);
+  assert.equal(failed.today.cost_eur_nanos, 0);
+  assert.match(
+    failed.diagnostics.join('\n'),
+    /transient Windows read failure/i,
+  );
+
+  fs.openSync = originalOpenSync;
+  const recovered = runtime.buildHookRollup(dataRoot, {
+    rootThreadId: 'transient-rollup-root',
+    now: '2026-08-20T13:01:00.000Z',
+  });
+  assert.equal(recovered.complete, true);
+  assert.equal(recovered.today.cost_eur_nanos, 17);
+  assert.equal(recovered.session.cost_eur_nanos, 17);
+  assert.doesNotMatch(
+    recovered.diagnostics.join('\n'),
+    /transient Windows read failure/i,
+  );
+});
+
+test('serializes concurrent ledger and compact-rollup updates', async (t) => {
+  const dataRoot = temporaryData(t);
+  const runtimeModulePath = require.resolve(
+    '../plugins/codex-cost-meter/lib/runtime-data',
+  );
+  const script = [
+    "const runtime=require(process.argv[1]);",
+    'const dataRoot=process.argv[2];',
+    'const index=Number(process.argv[3]);',
+    'const usage={input_tokens:index+1,cached_input_tokens:0,cache_write_input_tokens:0,output_tokens:1,reasoning_output_tokens:0,total_tokens:index+2};',
+    'runtime.appendLedgerRecord(dataRoot,{',
+    'schema:2,root_thread_id:"concurrent-rollup-root",session_id:"concurrent-rollup-session",turn_id:`concurrent-${index}`,',
+    'completed_at:`2026-08-20T12:00:0${index}.000Z`,written_at:`2026-08-20T12:01:0${index}.000Z`,',
+    'pricing_as_of:"2026-08-20",eur_per_usd:0.9,usage,cost_usd_nanos:index+1,cost_eur_nanos:index+1,',
+    'model_breakdown:[{model:"gpt-test",usage,cost_usd_nanos:index+1,cost_eur_nanos:index+1}],',
+    'agent_breakdown:{root:{usage,cost_usd_nanos:index+1,cost_eur_nanos:index+1},subagents:{usage:{input_tokens:0,cached_input_tokens:0,cache_write_input_tokens:0,output_tokens:0,reasoning_output_tokens:0,total_tokens:0},cost_usd_nanos:0,cost_eur_nanos:0,thread_count:0}}',
+    '},{rollupNow:"2026-08-20T13:00:00.000Z"});',
+  ].join('');
+  const children = Array.from({ length: 4 }, (_, index) =>
+    new Promise((resolve, reject) => {
+      const child = spawn(
+        process.execPath,
+        [
+          '-e',
+          script,
+          runtimeModulePath,
+          dataRoot,
+          String(index),
+        ],
+        { stdio: ['ignore', 'ignore', 'pipe'] },
+      );
+      let errorOutput = '';
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', (chunk) => {
+        errorOutput += chunk;
+      });
+      child.on('error', reject);
+      child.on('exit', (code) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(
+            new Error(
+              `Concurrent rollup writer exited ${code}: ${errorOutput}`,
+            ),
+          );
+        }
+      });
+      t.after(() => child.kill());
+    }),
+  );
+  await Promise.all(children);
+
+  const rollup = runtime.buildHookRollup(dataRoot, {
+    rootThreadId: 'concurrent-rollup-root',
+    now: '2026-08-20T13:01:00.000Z',
+  });
+  assert.equal(rollup.complete, true);
+  assert.equal(rollup.session.turns, 4);
+  assert.equal(rollup.session.cost_eur_nanos, 10);
+  assert.equal(rollup.session.usage.input_tokens, 10);
+  assert.equal(rollup.session.usage.output_tokens, 4);
+  assert.equal(rollup.session.usage.total_tokens, 14);
 });

@@ -8,7 +8,8 @@ const zlib = require('node:zlib');
 
 const SETTINGS_SCHEMA = 1;
 const LEDGER_SCHEMA = 2;
-const LEDGER_READ_CACHE_SCHEMA = 3;
+const LEDGER_READ_CACHE_SCHEMA = 4;
+const HOOK_ROLLUP_SCHEMA = 2;
 const LEDGER_READ_CACHE_TAIL_BYTES = 128;
 const DEFAULT_HOOK_LEDGER_FILES_PER_MONTH = 128;
 const EUR_NANOS = 1_000_000_000;
@@ -744,7 +745,21 @@ function normalizeLedgerGap(input, options = {}) {
     );
   }
 
-  return {
+  const knownFields = [
+    'known_usage',
+    'known_cost_usd_nanos',
+    'known_cost_eur_nanos',
+  ];
+  const knownFieldCount = knownFields.filter((field) =>
+    Object.hasOwn(input, field),
+  ).length;
+  if (knownFieldCount !== 0 && knownFieldCount !== knownFields.length) {
+    throw new TypeError(
+      'Ledger gap known_usage, known_cost_usd_nanos, and known_cost_eur_nanos must be provided together.',
+    );
+  }
+
+  const gap = {
     schema: LEDGER_SCHEMA,
     entry_type: 'gap',
     root_thread_id: requireString(input.root_thread_id, 'root_thread_id'),
@@ -757,6 +772,38 @@ function normalizeLedgerGap(input, options = {}) {
     ),
     reason: input.reason,
   };
+  if (knownFieldCount === knownFields.length) {
+    gap.known_usage = requireLedgerUsage(input.known_usage);
+    gap.known_cost_usd_nanos = requireNanos(
+      input.known_cost_usd_nanos,
+      'known_cost_usd_nanos',
+    );
+    gap.known_cost_eur_nanos = requireNanos(
+      input.known_cost_eur_nanos,
+      'known_cost_eur_nanos',
+    );
+  }
+  return gap;
+}
+
+function ledgerGapHasKnownSummary(gap) {
+  return (
+    isObject(gap?.known_usage) &&
+    Number.isSafeInteger(gap?.known_cost_usd_nanos) &&
+    Number.isSafeInteger(gap?.known_cost_eur_nanos)
+  );
+}
+
+function knownGapExceedsRecord(gap, record) {
+  if (!ledgerGapHasKnownSummary(gap)) {
+    return false;
+  }
+  return (
+    gap.known_cost_eur_nanos > record.cost_eur_nanos ||
+    !Number.isSafeInteger(record.cost_usd_nanos) ||
+    gap.known_cost_usd_nanos > record.cost_usd_nanos ||
+    usageExceeds(gap.known_usage, record.usage)
+  );
 }
 
 function safeHash(value, length = 16) {
@@ -785,7 +832,7 @@ function ledgerPathFor(dataRoot, record) {
     resolveDataRoot(dataRoot),
     'usage',
     utcMonth,
-    `task-${safeHash(record.root_thread_id, 24)}.jsonl`,
+    'turns.jsonl',
   );
 }
 
@@ -879,7 +926,7 @@ function validateCachedLedgerFile(value) {
   if (
     !isObject(value) ||
     typeof value.relative_path !== 'string' ||
-    !/^\d{4}-\d{2}\/[^/]+\.jsonl$/.test(value.relative_path) ||
+    !/^\d{4}-\d{2}\/turns\.jsonl$/.test(value.relative_path) ||
     !validLedgerFileVersion(value.source) ||
     !Number.isSafeInteger(value.line_count) ||
     value.line_count < 0 ||
@@ -924,8 +971,7 @@ function validateCachedLedgerDirectory(value) {
     !Array.isArray(value.pending_files) ||
     !value.pending_files.every(
       (fileName) =>
-        typeof fileName === 'string' &&
-        /^[^/]+\.jsonl$/.test(fileName),
+        fileName === 'turns.jsonl',
     ) ||
     !(
       value.generation_source === null ||
@@ -1336,18 +1382,27 @@ function readLedgerMonth(
         cachedDirectory.generation_source,
       );
     const files = canResume ? [...cachedFiles] : [];
-    const pendingFiles = canResume
-      ? [...cachedDirectory.pending_files]
-      : fs
-          .readdirSync(monthInfo.directoryPath, {
-            withFileTypes: true,
-          })
-          .filter(
-            (entry) =>
-              entry.isFile() && entry.name.endsWith('.jsonl'),
-          )
-          .map((entry) => entry.name)
-          .sort((left, right) => left.localeCompare(right));
+    let pendingFiles;
+    if (canResume) {
+      pendingFiles = [...cachedDirectory.pending_files];
+    } else {
+      const canonicalPath = path.join(
+        monthInfo.directoryPath,
+        'turns.jsonl',
+      );
+      try {
+        pendingFiles = fs
+          .lstatSync(canonicalPath)
+          .isFile()
+          ? ['turns.jsonl']
+          : [];
+      } catch (error) {
+        if (error?.code !== 'ENOENT') {
+          throw error;
+        }
+        pendingFiles = [];
+      }
+    }
     let processed = 0;
     while (
       pendingFiles.length > 0 &&
@@ -1399,9 +1454,11 @@ function reconcileLedgerFiles(
   files,
   initialDiagnostics = [],
   initialComplete = true,
+  initialIssues = [],
 ) {
   const diagnostics = [...initialDiagnostics];
   const conflicts = [];
+  const issues = [...initialIssues];
   const recordsByTurn = new Map();
   const gapsByTurn = new Map();
   let complete = initialComplete;
@@ -1409,6 +1466,19 @@ function reconcileLedgerFiles(
   for (const file of files) {
     diagnostics.push(...file.diagnostics);
     complete = complete && file.complete;
+    if (!file.complete) {
+      const relativePath = file.relative_path ?? '';
+      const monthMatch = /^(\d{4}-\d{2})\/turns\.jsonl$/.exec(
+        relativePath,
+      );
+      issues.push({
+        kind: monthMatch ? 'month' : 'global',
+        utc_month: monthMatch?.[1] ?? null,
+        task_key: null,
+        completed_at: null,
+        diagnostics: [...file.diagnostics],
+      });
+    }
     for (const entry of file.entries) {
       const isGap = entry.entry_type === 'gap';
 
@@ -1417,18 +1487,26 @@ function reconcileLedgerFiles(
         const existingRecord = recordsByTurn.get(key);
         const existingGap = gapsByTurn.get(key);
         if (existingRecord) {
-          complete = false;
-          conflicts.push({
-            key,
-            kind: 'gap-after-record',
-            root_thread_id: entry.root_thread_id,
-            turn_id: entry.turn_id,
-            first: existingRecord,
-            conflicting: entry,
-          });
-          diagnostics.push(
-            `Gap after exact record ignored for ${safeTaskLabel(entry.root_thread_id)} ${safeTurnLabel(entry.turn_id)}.`,
-          );
+          if (knownGapExceedsRecord(entry, existingRecord)) {
+            complete = false;
+            conflicts.push({
+              key,
+              kind: 'gap-known-summary-exceeds-record',
+              root_thread_id: entry.root_thread_id,
+              turn_id: entry.turn_id,
+              first: existingRecord,
+              conflicting: entry,
+            });
+            const diagnostic = `Gap known lower bound exceeds its exact record for ${safeTaskLabel(entry.root_thread_id)} ${safeTurnLabel(entry.turn_id)}.`;
+            diagnostics.push(diagnostic);
+            issues.push({
+              kind: 'conflict',
+              utc_month: entry.completed_at.slice(0, 7),
+              task_key: safeHash(entry.root_thread_id, 24),
+              completed_at: entry.completed_at,
+              diagnostics: [diagnostic],
+            });
+          }
           continue;
         }
         if (!existingGap) {
@@ -1448,6 +1526,15 @@ function reconcileLedgerFiles(
           diagnostics.push(
             `Conflicting gap ignored for ${safeTaskLabel(entry.root_thread_id)} ${safeTurnLabel(entry.turn_id)}.`,
           );
+          issues.push({
+            kind: 'conflict',
+            utc_month: entry.completed_at.slice(0, 7),
+            task_key: safeHash(entry.root_thread_id, 24),
+            completed_at: entry.completed_at,
+            diagnostics: [
+              `Conflicting gap ignored for ${safeTaskLabel(entry.root_thread_id)} ${safeTurnLabel(entry.turn_id)}.`,
+            ],
+          });
         }
         continue;
       }
@@ -1466,6 +1553,15 @@ function reconcileLedgerFiles(
         diagnostics.push(
           `Conflicting duplicate ignored for ${safeTaskLabel(entry.root_thread_id)} ${safeTurnLabel(entry.turn_id)}.`,
         );
+        issues.push({
+          kind: 'conflict',
+          utc_month: entry.completed_at.slice(0, 7),
+          task_key: safeHash(entry.root_thread_id, 24),
+          completed_at: entry.completed_at,
+          diagnostics: [
+            `Conflicting duplicate ignored for ${safeTaskLabel(entry.root_thread_id)} ${safeTurnLabel(entry.turn_id)}.`,
+          ],
+        });
         continue;
       }
       if (!existing) {
@@ -1474,21 +1570,28 @@ function reconcileLedgerFiles(
 
       const gap = gapsByTurn.get(key);
       if (gap) {
-        if (gap.completed_at === entry.completed_at) {
+        if (!knownGapExceedsRecord(gap, entry)) {
           gapsByTurn.delete(key);
         } else {
           complete = false;
+          gapsByTurn.delete(key);
           conflicts.push({
             key,
-            kind: 'gap-record-timestamp-mismatch',
+            kind: 'gap-known-summary-exceeds-record',
             root_thread_id: entry.root_thread_id,
             turn_id: entry.turn_id,
             first: gap,
             conflicting: entry,
           });
-          diagnostics.push(
-            `Exact record did not match its gap timestamp for ${safeTaskLabel(entry.root_thread_id)} ${safeTurnLabel(entry.turn_id)}.`,
-          );
+          const diagnostic = `Exact record is below its known gap lower bound for ${safeTaskLabel(entry.root_thread_id)} ${safeTurnLabel(entry.turn_id)}.`;
+          diagnostics.push(diagnostic);
+          issues.push({
+            kind: 'conflict',
+            utc_month: entry.completed_at.slice(0, 7),
+            task_key: safeHash(entry.root_thread_id, 24),
+            completed_at: entry.completed_at,
+            diagnostics: [diagnostic],
+          });
         }
       }
     }
@@ -1498,6 +1601,7 @@ function reconcileLedgerFiles(
     records: [...recordsByTurn.values()],
     gaps: [...gapsByTurn.values()],
     conflicts,
+    issues,
     diagnostics,
     complete,
   };
@@ -1507,6 +1611,17 @@ function readLedger(dataRoot, options = {}) {
   const root = resolveDataRoot(dataRoot);
   const diagnostics = [];
   const discovered = ledgerMonths(root, diagnostics);
+  const issues = discovered.complete
+    ? []
+    : [
+        {
+          kind: 'global',
+          utc_month: null,
+          task_key: null,
+          completed_at: null,
+          diagnostics: [...diagnostics],
+        },
+      ];
   const requestedMonths = Array.isArray(options.months)
     ? new Set(
         options.months.filter(
@@ -1584,16 +1699,28 @@ function readLedger(dataRoot, options = {}) {
       cacheChanged = cacheChanged || !loaded.reused;
       if (!loaded.directory.complete) {
         traversalComplete = false;
-        diagnostics.push(
-          `Usage ledger cache is warming for ${monthInfo.month}; ${loaded.directory.pending_files.length} files remain.`,
-        );
+        const diagnostic = `Usage ledger cache is warming for ${monthInfo.month}; ${loaded.directory.pending_files.length} files remain.`;
+        diagnostics.push(diagnostic);
+        issues.push({
+          kind: 'month',
+          utc_month: monthInfo.month,
+          task_key: null,
+          completed_at: null,
+          diagnostics: [diagnostic],
+        });
       }
     } catch (error) {
       traversalComplete = false;
       cacheWritable = false;
-      diagnostics.push(
-        `Usage month ${monthInfo.month} could not be read: ${error.message}`,
-      );
+      const diagnostic = `Usage month ${monthInfo.month} could not be read: ${error.message}`;
+      diagnostics.push(diagnostic);
+      issues.push({
+        kind: 'month',
+        utc_month: monthInfo.month,
+        task_key: null,
+        completed_at: null,
+        diagnostics: [diagnostic],
+      });
     }
   }
 
@@ -1628,6 +1755,7 @@ function readLedger(dataRoot, options = {}) {
     files,
     diagnostics,
     traversalComplete,
+    issues,
   );
 }
 
@@ -1653,7 +1781,7 @@ function refreshLedgerReadCacheAfterAppend(dataRoot, ledgerPath) {
     .relative(usageRoot, ledgerPath)
     .split(path.sep)
     .join('/');
-  const match = /^(\d{4}-\d{2})\/[^/]+\.jsonl$/.exec(relativePath);
+  const match = /^(\d{4}-\d{2})\/turns\.jsonl$/.exec(relativePath);
   if (!match) {
     throw new Error('Ledger path is outside the usage ledger.');
   }
@@ -1702,31 +1830,930 @@ function refreshLedgerReadCacheAfterAppend(dataRoot, ledgerPath) {
 }
 
 function readLedgerTaskFiles(dataRoot, record) {
-  const root = resolveDataRoot(dataRoot);
-  const diagnostics = [];
-  const discovered = ledgerMonths(root, diagnostics);
-  const fileName = path.basename(ledgerPathFor(root, record));
-  const files = [];
-  let complete = discovered.complete;
+  void record;
+  return readLedger(dataRoot);
+}
 
+function hookRollupCachePath(dataRoot) {
+  return path.join(
+    resolveDataRoot(dataRoot),
+    'cache',
+    `hook-rollup-v${HOOK_ROLLUP_SCHEMA}.json`,
+  );
+}
+
+function emptyHookRollupSummary() {
+  return {
+    cost_eur_nanos: 0,
+    usage: zeroUsage(),
+    turns: 0,
+    pending_turns: 0,
+  };
+}
+
+function hookRollupSessionKey(rootThreadId) {
+  return safeHash(rootThreadId, 64);
+}
+
+function hookRollupGapKey(rootThreadId, turnId) {
+  return safeHash(`${rootThreadId}\u0000${turnId}`, 64);
+}
+
+function validateHookRollupSummary(value) {
+  if (
+    !isObject(value) ||
+    !Number.isSafeInteger(value.turns) ||
+    value.turns < 0 ||
+    !Number.isSafeInteger(value.pending_turns) ||
+    value.pending_turns < 0
+  ) {
+    throw new TypeError('Hook rollup summary is invalid.');
+  }
+  return {
+    cost_eur_nanos: requireNanos(
+      value.cost_eur_nanos,
+      'cost_eur_nanos',
+    ),
+    usage: requireLedgerUsage(value.usage),
+    turns: value.turns,
+    pending_turns: value.pending_turns,
+  };
+}
+
+function validateHookRollupSource(value) {
+  if (
+    !isObject(value) ||
+    typeof value.complete !== 'boolean' ||
+    !Array.isArray(value.months)
+  ) {
+    throw new TypeError('Hook rollup source is invalid.');
+  }
+  const months = value.months.map((item) => {
+    if (
+      !isObject(item) ||
+      typeof item.month !== 'string' ||
+      !/^\d{4}-\d{2}$/.test(item.month) ||
+      !validLedgerFileVersion(item.directory) ||
+      !(
+        item.generation === null ||
+        validLedgerFileVersion(item.generation)
+      )
+    ) {
+      throw new TypeError('Hook rollup source month is invalid.');
+    }
+    return {
+      month: item.month,
+      directory: item.directory,
+      generation: item.generation,
+    };
+  });
+  if (
+    new Set(months.map((item) => item.month)).size !== months.length ||
+    months.some(
+      (item, index) =>
+        index > 0 && months[index - 1].month >= item.month,
+    )
+  ) {
+    throw new TypeError('Hook rollup source months are invalid.');
+  }
+  return { complete: value.complete, months };
+}
+
+function validateHookRollupSummaries(value, keyPattern, field) {
+  if (!isObject(value)) {
+    throw new TypeError(`Hook rollup ${field} are invalid.`);
+  }
+  const result = {};
+  for (const key of Object.keys(value).sort()) {
+    if (!keyPattern.test(key)) {
+      throw new TypeError(`Hook rollup ${field} key is invalid.`);
+    }
+    result[key] = validateHookRollupSummary(value[key]);
+  }
+  return result;
+}
+
+function validateHookRollupIssue(value) {
+  if (
+    !isObject(value) ||
+    !['global', 'month', 'file', 'conflict'].includes(value.kind) ||
+    !(
+      value.utc_month === null ||
+      (
+        typeof value.utc_month === 'string' &&
+        /^\d{4}-\d{2}$/.test(value.utc_month)
+      )
+    ) ||
+    !(
+      value.task_key === null ||
+      (
+        typeof value.task_key === 'string' &&
+        /^[a-f0-9]{24}$/.test(value.task_key)
+      )
+    ) ||
+    !(
+      value.completed_at === null ||
+      (
+        typeof value.completed_at === 'string' &&
+        normalizeTimestamp(value.completed_at, 'completed_at') ===
+          value.completed_at
+      )
+    ) ||
+    !Array.isArray(value.diagnostics) ||
+    value.diagnostics.length === 0 ||
+    !value.diagnostics.every(
+      (diagnostic) => typeof diagnostic === 'string',
+    )
+  ) {
+    throw new TypeError('Hook rollup issue is invalid.');
+  }
+  if (
+    (value.kind === 'global' &&
+      (
+        value.utc_month !== null ||
+        value.task_key !== null ||
+        value.completed_at !== null
+      )) ||
+    (value.kind === 'month' &&
+      (
+        value.utc_month === null ||
+        value.task_key !== null ||
+        value.completed_at !== null
+      )) ||
+    (value.kind === 'file' &&
+      (
+        value.utc_month === null ||
+        value.task_key === null ||
+        value.completed_at !== null
+      )) ||
+    (value.kind === 'conflict' &&
+      (
+        value.utc_month === null ||
+        value.task_key === null ||
+        value.completed_at === null
+      ))
+  ) {
+    throw new TypeError('Hook rollup issue scope is invalid.');
+  }
+  return {
+    kind: value.kind,
+    utc_month: value.utc_month,
+    task_key: value.task_key,
+    completed_at: value.completed_at,
+    diagnostics: [...value.diagnostics],
+  };
+}
+
+function validateHookRollupPayload(value) {
+  if (
+    !isObject(value) ||
+    !isValidTimeZone(value.timezone) ||
+    typeof value.active_date !== 'string' ||
+    !/^\d{4}-\d{2}-\d{2}$/.test(value.active_date) ||
+    value.active_month !== value.active_date.slice(0, 7) ||
+    !(
+      value.sealed_through === null ||
+      (
+        typeof value.sealed_through === 'string' &&
+        /^\d{4}-\d{2}-\d{2}$/.test(value.sealed_through) &&
+        value.sealed_through < value.active_date
+      )
+    ) ||
+    !Array.isArray(value.issues) ||
+    !isObject(value.unresolved_gaps)
+  ) {
+    throw new TypeError('Hook rollup payload is invalid.');
+  }
+
+  const source = validateHookRollupSource(value.source);
+  const days = validateHookRollupSummaries(
+    value.days,
+    /^\d{4}-\d{2}-\d{2}$/,
+    'days',
+  );
+  const months = validateHookRollupSummaries(
+    value.months,
+    /^\d{4}-\d{2}$/,
+    'months',
+  );
+  const sessions = validateHookRollupSummaries(
+    value.sessions,
+    /^[a-f0-9]{64}$/,
+    'sessions',
+  );
+  const unresolvedGaps = {};
+  const pendingByDay = new Map();
+  const pendingByMonth = new Map();
+  const pendingBySession = new Map();
+  for (const key of Object.keys(value.unresolved_gaps).sort()) {
+    const gap = value.unresolved_gaps[key];
+    const knownFields = [
+      'known_usage',
+      'known_cost_usd_nanos',
+      'known_cost_eur_nanos',
+    ];
+    const knownFieldCount = isObject(gap)
+      ? knownFields.filter((field) => Object.hasOwn(gap, field)).length
+      : 0;
+    if (
+      !/^[a-f0-9]{64}$/.test(key) ||
+      !isObject(gap) ||
+      typeof gap.session_key !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(gap.session_key) ||
+      typeof gap.date !== 'string' ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(gap.date) ||
+      gap.month !== gap.date.slice(0, 7) ||
+      (knownFieldCount !== 0 && knownFieldCount !== knownFields.length)
+    ) {
+      throw new TypeError('Hook rollup unresolved gap is invalid.');
+    }
+    const normalizedGap = {
+      session_key: gap.session_key,
+      date: gap.date,
+      month: gap.month,
+    };
+    if (knownFieldCount === knownFields.length) {
+      normalizedGap.known_usage = requireLedgerUsage(gap.known_usage);
+      normalizedGap.known_cost_usd_nanos = requireNanos(
+        gap.known_cost_usd_nanos,
+        'known_cost_usd_nanos',
+      );
+      normalizedGap.known_cost_eur_nanos = requireNanos(
+        gap.known_cost_eur_nanos,
+        'known_cost_eur_nanos',
+      );
+    }
+    unresolvedGaps[key] = normalizedGap;
+    pendingByDay.set(gap.date, (pendingByDay.get(gap.date) ?? 0) + 1);
+    pendingByMonth.set(
+      gap.month,
+      (pendingByMonth.get(gap.month) ?? 0) + 1,
+    );
+    pendingBySession.set(
+      gap.session_key,
+      (pendingBySession.get(gap.session_key) ?? 0) + 1,
+    );
+  }
+
+  for (const [key, summary] of Object.entries(days)) {
+    if (summary.pending_turns !== (pendingByDay.get(key) ?? 0)) {
+      throw new TypeError('Hook rollup day pending count is invalid.');
+    }
+  }
+  for (const [key, summary] of Object.entries(months)) {
+    if (summary.pending_turns !== (pendingByMonth.get(key) ?? 0)) {
+      throw new TypeError('Hook rollup month pending count is invalid.');
+    }
+  }
+  for (const [key, summary] of Object.entries(sessions)) {
+    if (summary.pending_turns !== (pendingBySession.get(key) ?? 0)) {
+      throw new TypeError('Hook rollup session pending count is invalid.');
+    }
+  }
+  if (
+    [...pendingByDay.keys()].some((key) => !Object.hasOwn(days, key)) ||
+    [...pendingByMonth.keys()].some((key) => !Object.hasOwn(months, key)) ||
+    [...pendingBySession.keys()].some(
+      (key) => !Object.hasOwn(sessions, key),
+    )
+  ) {
+    throw new TypeError('Hook rollup pending summaries are incomplete.');
+  }
+
+  return {
+    timezone: value.timezone,
+    active_date: value.active_date,
+    active_month: value.active_month,
+    sealed_through: value.sealed_through,
+    source,
+    issues: value.issues.map(validateHookRollupIssue),
+    days,
+    months,
+    sessions,
+    unresolved_gaps: unresolvedGaps,
+  };
+}
+
+function canonicalHookRollupPayload(payload) {
+  const sortObject = (value) =>
+    Object.fromEntries(
+      Object.entries(value).sort(([left], [right]) =>
+        left.localeCompare(right),
+      ),
+    );
+  const issues = [
+    ...new Map(
+      payload.issues.map((issue) => [stableStringify(issue), issue]),
+    ).values(),
+  ].sort((left, right) =>
+    stableStringify(left).localeCompare(stableStringify(right)),
+  );
+  return {
+    timezone: payload.timezone,
+    active_date: payload.active_date,
+    active_month: payload.active_month,
+    sealed_through: payload.sealed_through,
+    source: {
+      complete: payload.source.complete,
+      months: [...payload.source.months].sort((left, right) =>
+        left.month.localeCompare(right.month),
+      ),
+    },
+    issues,
+    days: sortObject(payload.days),
+    months: sortObject(payload.months),
+    sessions: sortObject(payload.sessions),
+    unresolved_gaps: sortObject(payload.unresolved_gaps),
+  };
+}
+
+function loadHookRollupCache(dataRoot) {
+  const filePath = hookRollupCachePath(dataRoot);
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return { payload: null, diagnostics: [] };
+    }
+    return {
+      payload: null,
+      diagnostics: [
+        `Hook rollup cache will be rebuilt: ${error.message}`,
+      ],
+    };
+  }
+
+  try {
+    if (
+      !isObject(parsed) ||
+      parsed.schema !== HOOK_ROLLUP_SCHEMA ||
+      typeof parsed.checksum !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(parsed.checksum) ||
+      !isObject(parsed.payload)
+    ) {
+      throw new TypeError('Hook rollup cache wrapper is invalid.');
+    }
+    const checksum = hashBuffer(
+      Buffer.from(stableStringify(parsed.payload), 'utf8'),
+    );
+    if (checksum !== parsed.checksum) {
+      throw new TypeError('Hook rollup cache checksum does not match.');
+    }
+    return {
+      payload: validateHookRollupPayload(parsed.payload),
+      diagnostics: [],
+    };
+  } catch (error) {
+    return {
+      payload: null,
+      diagnostics: [
+        `Hook rollup cache will be rebuilt: ${error.message}`,
+      ],
+    };
+  }
+}
+
+function saveHookRollupCache(dataRoot, input) {
+  const payload = canonicalHookRollupPayload(input);
+  atomicWriteJson(hookRollupCachePath(dataRoot), {
+    schema: HOOK_ROLLUP_SCHEMA,
+    checksum: hashBuffer(
+      Buffer.from(stableStringify(payload), 'utf8'),
+    ),
+    payload,
+  });
+  return payload;
+}
+
+function captureHookRollupSource(dataRoot) {
+  const diagnostics = [];
+  const discovered = ledgerMonths(dataRoot, diagnostics);
+  const issues = discovered.complete
+    ? []
+    : [
+        {
+          kind: 'global',
+          utc_month: null,
+          task_key: null,
+          completed_at: null,
+          diagnostics: [...diagnostics],
+        },
+      ];
+  const months = [];
+  let complete = discovered.complete;
   for (const monthInfo of discovered.months) {
-    const filePath = path.join(monthInfo.directoryPath, fileName);
     try {
-      const loaded = readStableLedgerFile(filePath);
-      loaded.file.relative_path = `${monthInfo.month}/${fileName}`;
-      files.push(loaded.file);
-    } catch (error) {
-      if (error?.code === 'ENOENT') {
-        continue;
+      const directory = fs.statSync(monthInfo.directoryPath, {
+        bigint: true,
+      });
+      if (!directory.isDirectory()) {
+        throw new Error('Usage month path is not a directory.');
       }
+      months.push({
+        month: monthInfo.month,
+        directory: ledgerFileVersion(directory),
+        generation: optionalLedgerFileVersion(
+          ledgerGenerationPath(monthInfo.directoryPath),
+        ),
+      });
+    } catch (error) {
       complete = false;
-      diagnostics.push(
-        `Ledger ${fileName} in ${monthInfo.month} could not be read: ${error.message}`,
+      const diagnostic = `Usage month ${monthInfo.month} source could not be read: ${error.message}`;
+      diagnostics.push(diagnostic);
+      issues.push({
+        kind: 'month',
+        utc_month: monthInfo.month,
+        task_key: null,
+        completed_at: null,
+        diagnostics: [diagnostic],
+      });
+    }
+  }
+  return {
+    source: {
+      complete,
+      months: months.sort((left, right) =>
+        left.month.localeCompare(right.month),
+      ),
+    },
+    diagnostics,
+    issues,
+  };
+}
+
+function sameHookRollupSource(left, right) {
+  return stableStringify(left) === stableStringify(right);
+}
+
+function hookRollupSummary(payload, field, key) {
+  if (!Object.hasOwn(payload[field], key)) {
+    payload[field][key] = emptyHookRollupSummary();
+  }
+  return payload[field][key];
+}
+
+function addHookRollupRecord(summary, record) {
+  summary.cost_eur_nanos += record.cost_eur_nanos;
+  summary.usage = addUsage(summary.usage, record.usage);
+  summary.turns += 1;
+}
+
+function addHookRollupKnownSummary(summary, gap) {
+  if (!ledgerGapHasKnownSummary(gap)) {
+    return;
+  }
+  summary.cost_eur_nanos += gap.known_cost_eur_nanos;
+  summary.usage = addUsage(summary.usage, gap.known_usage);
+}
+
+function subtractHookRollupKnownSummary(summary, gap) {
+  if (!ledgerGapHasKnownSummary(gap)) {
+    return;
+  }
+  if (
+    gap.known_cost_eur_nanos > summary.cost_eur_nanos ||
+    usageExceeds(gap.known_usage, summary.usage)
+  ) {
+    throw new Error('Hook rollup known gap summary exceeds its aggregate.');
+  }
+  summary.cost_eur_nanos -= gap.known_cost_eur_nanos;
+  summary.usage = subtractUsage(summary.usage, gap.known_usage);
+}
+
+function adjustHookRollupPending(summary, delta) {
+  summary.pending_turns += delta;
+  if (summary.pending_turns < 0) {
+    throw new Error('Hook rollup pending count became negative.');
+  }
+}
+
+function removeHookRollupGap(payload, gapKey) {
+  const gap = payload.unresolved_gaps[gapKey];
+  if (!gap) {
+    return false;
+  }
+  subtractHookRollupKnownSummary(
+    hookRollupSummary(payload, 'days', gap.date),
+    gap,
+  );
+  subtractHookRollupKnownSummary(
+    hookRollupSummary(payload, 'months', gap.month),
+    gap,
+  );
+  subtractHookRollupKnownSummary(
+    hookRollupSummary(payload, 'sessions', gap.session_key),
+    gap,
+  );
+  adjustHookRollupPending(
+    hookRollupSummary(payload, 'days', gap.date),
+    -1,
+  );
+  adjustHookRollupPending(
+    hookRollupSummary(payload, 'months', gap.month),
+    -1,
+  );
+  adjustHookRollupPending(
+    hookRollupSummary(payload, 'sessions', gap.session_key),
+    -1,
+  );
+  delete payload.unresolved_gaps[gapKey];
+  return true;
+}
+
+function applyHookRollupRecord(payload, record) {
+  const parts = localDateParts(record.completed_at, payload.timezone);
+  const sessionKey = hookRollupSessionKey(record.root_thread_id);
+  removeHookRollupGap(
+    payload,
+    hookRollupGapKey(record.root_thread_id, record.turn_id),
+  );
+  addHookRollupRecord(
+    hookRollupSummary(payload, 'days', parts.date),
+    record,
+  );
+  addHookRollupRecord(
+    hookRollupSummary(payload, 'months', parts.monthKey),
+    record,
+  );
+  addHookRollupRecord(
+    hookRollupSummary(payload, 'sessions', sessionKey),
+    record,
+  );
+}
+
+function applyHookRollupGap(payload, gap) {
+  const gapKey = hookRollupGapKey(gap.root_thread_id, gap.turn_id);
+  if (Object.hasOwn(payload.unresolved_gaps, gapKey)) {
+    return;
+  }
+  const parts = localDateParts(gap.completed_at, payload.timezone);
+  const sessionKey = hookRollupSessionKey(gap.root_thread_id);
+  payload.unresolved_gaps[gapKey] = {
+    session_key: sessionKey,
+    date: parts.date,
+    month: parts.monthKey,
+    ...(ledgerGapHasKnownSummary(gap)
+      ? {
+          known_usage: gap.known_usage,
+          known_cost_usd_nanos: gap.known_cost_usd_nanos,
+          known_cost_eur_nanos: gap.known_cost_eur_nanos,
+        }
+      : {}),
+  };
+  addHookRollupKnownSummary(
+    hookRollupSummary(payload, 'days', parts.date),
+    gap,
+  );
+  addHookRollupKnownSummary(
+    hookRollupSummary(payload, 'months', parts.monthKey),
+    gap,
+  );
+  addHookRollupKnownSummary(
+    hookRollupSummary(payload, 'sessions', sessionKey),
+    gap,
+  );
+  adjustHookRollupPending(
+    hookRollupSummary(payload, 'days', parts.date),
+    1,
+  );
+  adjustHookRollupPending(
+    hookRollupSummary(payload, 'months', parts.monthKey),
+    1,
+  );
+  adjustHookRollupPending(
+    hookRollupSummary(payload, 'sessions', sessionKey),
+    1,
+  );
+}
+
+function rollHookRollupClock(payload, now) {
+  const parts = localDateParts(now, payload.timezone);
+  if (payload.active_date === parts.date) {
+    return false;
+  }
+  payload.active_date = parts.date;
+  payload.active_month = parts.monthKey;
+  payload.sealed_through = shiftDateKey(parts.date, -1);
+  return true;
+}
+
+function createHookRollupPayload(ledger, sourceResult, timeZone, now) {
+  const nowParts = localDateParts(now, timeZone);
+  const issues = [
+    ...(ledger.issues ?? []),
+    ...(sourceResult.issues ?? []),
+  ];
+  if (!ledger.complete && issues.length === 0) {
+    issues.push({
+      kind: 'global',
+      utc_month: null,
+      task_key: null,
+      completed_at: null,
+      diagnostics:
+        ledger.diagnostics.length > 0
+          ? [...ledger.diagnostics]
+          : ['Usage ledger traversal is incomplete.'],
+    });
+  }
+  const payload = {
+    timezone: timeZone,
+    active_date: nowParts.date,
+    active_month: nowParts.monthKey,
+    sealed_through: shiftDateKey(nowParts.date, -1),
+    source: sourceResult.source,
+    issues,
+    days: {},
+    months: {},
+    sessions: {},
+    unresolved_gaps: {},
+  };
+  const compareEntries = (left, right) =>
+    left.completed_at.localeCompare(right.completed_at) ||
+    left.root_thread_id.localeCompare(right.root_thread_id) ||
+    left.turn_id.localeCompare(right.turn_id);
+  for (const record of [...ledger.records].sort(compareEntries)) {
+    applyHookRollupRecord(payload, record);
+  }
+  for (const gap of [...ledger.gaps].sort(compareEntries)) {
+    applyHookRollupGap(payload, gap);
+  }
+  return payload;
+}
+
+function rebuildHookRollupCacheLocked(dataRoot, timeZone, now) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const before = captureHookRollupSource(dataRoot);
+    const ledger = readLedger(dataRoot);
+    const after = captureHookRollupSource(dataRoot);
+    if (sameHookRollupSource(before.source, after.source)) {
+      return saveHookRollupCache(
+        dataRoot,
+        createHookRollupPayload(ledger, after, timeZone, now),
       );
     }
   }
+  throw new Error(
+    'Usage ledger kept changing while the hook rollup was rebuilt.',
+  );
+}
 
-  return reconcileLedgerFiles(files, diagnostics, complete);
+function resolveHookRollupSettings(dataRoot, options = {}) {
+  return options.settings
+    ? normalizeSettings(
+        options.settings.settings ?? options.settings,
+        { diagnoseMissing: false },
+      )
+    : loadSettings(dataRoot);
+}
+
+function prepareHookRollupAppend(dataRoot, options = {}) {
+  const loadedSettings = resolveHookRollupSettings(dataRoot, options);
+  const timeZone = loadedSettings.settings.timezone;
+  const now = toTimestamp(
+    options.rollupNow ?? options.now ?? Date.now(),
+    'rollupNow',
+  );
+  const cached = loadHookRollupCache(dataRoot);
+  const source = captureHookRollupSource(dataRoot);
+  if (
+    cached.payload &&
+    cached.payload.timezone === timeZone &&
+    source.source.complete &&
+    sameHookRollupSource(cached.payload.source, source.source)
+  ) {
+    rollHookRollupClock(cached.payload, now);
+    return {
+      payload: cached.payload,
+      timeZone,
+      now,
+      diagnostics: loadedSettings.diagnostics ?? [],
+    };
+  }
+  return {
+    payload: null,
+    timeZone,
+    now,
+    diagnostics: loadedSettings.diagnostics ?? [],
+  };
+}
+
+function updateHookRollupAfterAppend(dataRoot, entry, prepared) {
+  if (!prepared.payload) {
+    const ledgerCache = loadLedgerReadCache(dataRoot);
+    if (
+      ledgerCache?.directories.some(
+        (directory) => !directory.complete,
+      )
+    ) {
+      // Preserve the bounded warming contract of the general ledger cache.
+      // buildHookRollup() will finish the compact-ledger rebuild explicitly;
+      // an ordinary append must not unexpectedly traverse every pending file.
+      return null;
+    }
+    return rebuildHookRollupCacheLocked(
+      dataRoot,
+      prepared.timeZone,
+      prepared.now,
+    );
+  }
+  if (entry.entry_type === 'gap') {
+    applyHookRollupGap(prepared.payload, entry);
+  } else {
+    applyHookRollupRecord(prepared.payload, entry);
+  }
+  const source = captureHookRollupSource(dataRoot);
+  prepared.payload.source = source.source;
+  prepared.payload.issues.push(...source.issues);
+  return saveHookRollupCache(dataRoot, prepared.payload);
+}
+
+function hookRollupScope(summary, identity, issues) {
+  const value = summary ?? emptyHookRollupSummary();
+  return {
+    ...identity,
+    cost_eur_nanos: value.cost_eur_nanos,
+    usage: { ...value.usage },
+    turns: value.turns,
+    complete: issues.length === 0 && value.pending_turns === 0,
+    pending_turns: value.pending_turns,
+  };
+}
+
+function hookRollupPeriodIssues(payload, now, timeZone, period) {
+  const nowParts = localDateParts(now, timeZone);
+  const possibleUtcMonths = new Set(nearbyUtcMonthKeys(now));
+  return payload.issues.filter((issue) => {
+    if (issue.kind === 'global') {
+      return true;
+    }
+    if (issue.kind === 'conflict') {
+      const parts = localDateParts(issue.completed_at, timeZone);
+      return period === 'day'
+        ? parts.date === nowParts.date
+        : parts.monthKey === nowParts.monthKey;
+    }
+    return possibleUtcMonths.has(issue.utc_month);
+  });
+}
+
+function hookRollupSessionIssues(payload, rootThreadId) {
+  const taskKey = safeHash(rootThreadId, 24);
+  return payload.issues.filter(
+    (issue) =>
+      issue.kind === 'global' ||
+      (issue.kind === 'month' && issue.task_key === null) ||
+      issue.task_key === taskKey,
+  );
+}
+
+function hookRollupIssueDiagnostics(issues) {
+  return issues.flatMap((issue) => issue.diagnostics);
+}
+
+function hookRollupRelevantIssues(
+  payload,
+  now,
+  timeZone,
+  rootThreadId,
+) {
+  const issues = [
+    ...hookRollupPeriodIssues(payload, now, timeZone, 'day'),
+    ...hookRollupPeriodIssues(payload, now, timeZone, 'month'),
+    ...hookRollupSessionIssues(payload, rootThreadId),
+  ];
+  return [
+    ...new Map(
+      issues.map((issue) => [stableStringify(issue), issue]),
+    ).values(),
+  ];
+}
+
+function buildHookRollup(dataRoot, options = {}) {
+  const root = resolveDataRoot(dataRoot);
+  const loadedSettings = resolveHookRollupSettings(root, options);
+  const settings = loadedSettings.settings;
+  const now = toTimestamp(options.now ?? options.nowMs ?? Date.now(), 'now');
+  const rootThreadId = requireString(
+    options.rootThreadId,
+    'rootThreadId',
+  );
+  const nowParts = localDateParts(now, settings.timezone);
+  let cacheDiagnostics = [];
+  let cached = loadHookRollupCache(root);
+  cacheDiagnostics.push(...cached.diagnostics);
+  let source = captureHookRollupSource(root);
+  let payload =
+    cached.payload &&
+    cached.payload.timezone === settings.timezone &&
+    source.source.complete &&
+    sameHookRollupSource(cached.payload.source, source.source) &&
+    hookRollupRelevantIssues(
+      cached.payload,
+      now,
+      settings.timezone,
+      rootThreadId,
+    ).length === 0
+      ? cached.payload
+      : null;
+
+  if (!payload || payload.active_date !== nowParts.date) {
+    const lock = acquireLedgerWriteLock(root);
+    try {
+      cached = loadHookRollupCache(root);
+      cacheDiagnostics.push(...cached.diagnostics);
+      source = captureHookRollupSource(root);
+      payload =
+        cached.payload &&
+        cached.payload.timezone === settings.timezone &&
+        source.source.complete &&
+        sameHookRollupSource(cached.payload.source, source.source) &&
+        hookRollupRelevantIssues(
+          cached.payload,
+          now,
+          settings.timezone,
+          rootThreadId,
+        ).length === 0
+          ? cached.payload
+          : rebuildHookRollupCacheLocked(
+              root,
+              settings.timezone,
+              now,
+            );
+      if (rollHookRollupClock(payload, now)) {
+        payload = saveHookRollupCache(root, payload);
+      }
+    } finally {
+      releaseTurnLock(lock);
+    }
+  }
+
+  const sessionStorageKey = hookRollupSessionKey(rootThreadId);
+  const todayIssues = hookRollupPeriodIssues(
+    payload,
+    now,
+    settings.timezone,
+    'day',
+  );
+  const monthIssues = hookRollupPeriodIssues(
+    payload,
+    now,
+    settings.timezone,
+    'month',
+  );
+  const sessionIssues = hookRollupSessionIssues(
+    payload,
+    rootThreadId,
+  );
+  const today = hookRollupScope(
+    payload.days[nowParts.date],
+    { date: nowParts.date },
+    todayIssues,
+  );
+  const month = hookRollupScope(
+    payload.months[nowParts.monthKey],
+    { month: nowParts.monthKey },
+    monthIssues,
+  );
+  const session = hookRollupScope(
+    payload.sessions[sessionStorageKey],
+    { key: safeTaskKey(rootThreadId) },
+    sessionIssues,
+  );
+  const relevantGapKeys = Object.entries(payload.unresolved_gaps)
+    .filter(
+      ([, gap]) =>
+        gap.month === nowParts.monthKey ||
+        gap.session_key === sessionStorageKey,
+    )
+    .map(([key]) => key);
+  const pendingTurns = new Set(relevantGapKeys).size;
+  const complete = today.complete && month.complete && session.complete;
+  const diagnostics = [
+    ...(loadedSettings.diagnostics ?? []),
+    ...cacheDiagnostics,
+    ...hookRollupIssueDiagnostics([
+      ...todayIssues,
+      ...monthIssues,
+      ...sessionIssues,
+    ]),
+    ...(pendingTurns === 0
+      ? []
+      : [
+          `Accounting has ${pendingTurns} pending completed ${pendingTurns === 1 ? 'turn' : 'turns'} relevant to the current month or task; displayed totals are exact-known lower bounds.`,
+        ]),
+  ];
+  return {
+    schema: HOOK_ROLLUP_SCHEMA,
+    generated_at: new Date(now).toISOString(),
+    timezone: settings.timezone,
+    complete,
+    pending_turns: pendingTurns,
+    today,
+    month,
+    session,
+    diagnostics: [...new Set(diagnostics)],
+  };
 }
 
 function sleep(milliseconds) {
@@ -1902,7 +2929,7 @@ function appendLedgerRecord(dataRoot, input, options = {}) {
         diagnostics: existingLedger.diagnostics,
       };
     }
-    if (sameGap && sameGap.completed_at !== record.completed_at) {
+    if (sameGap && knownGapExceedsRecord(sameGap, record)) {
       return {
         record,
         recorded: false,
@@ -1912,11 +2939,12 @@ function appendLedgerRecord(dataRoot, input, options = {}) {
         ledgerPath,
         diagnostics: [
           ...existingLedger.diagnostics,
-          `Exact record did not match its gap timestamp for ${safeTaskLabel(record.root_thread_id)} ${safeTurnLabel(record.turn_id)}.`,
+          `Exact record is below its known gap lower bound for ${safeTaskLabel(record.root_thread_id)} ${safeTurnLabel(record.turn_id)}.`,
         ],
       };
     }
 
+    const hookRollup = prepareHookRollupAppend(root, options);
     fs.mkdirSync(path.dirname(ledgerPath), {
       recursive: true,
       mode: 0o700,
@@ -1930,6 +2958,13 @@ function appendLedgerRecord(dataRoot, input, options = {}) {
     } catch (error) {
       diagnostics.push(
         `Ledger read cache will be rebuilt: ${error.message}`,
+      );
+    }
+    try {
+      updateHookRollupAfterAppend(root, record, hookRollup);
+    } catch (error) {
+      diagnostics.push(
+        `Hook rollup cache will be rebuilt: ${error.message}`,
       );
     }
     return {
@@ -1977,7 +3012,7 @@ function appendLedgerGap(dataRoot, input, options = {}) {
         candidate.turn_id === gap.turn_id,
     );
     if (sameTurn) {
-      const matches = sameTurn.completed_at === gap.completed_at;
+      const matches = !knownGapExceedsRecord(gap, sameTurn);
       return {
         gap,
         recorded: false,
@@ -1989,7 +3024,7 @@ function appendLedgerGap(dataRoot, input, options = {}) {
           ? existingLedger.diagnostics
           : [
               ...existingLedger.diagnostics,
-              `Gap did not match the exact record timestamp for ${safeTaskLabel(gap.root_thread_id)} ${safeTurnLabel(gap.turn_id)}.`,
+              `Gap exceeded its exact record's known lower bound for ${safeTaskLabel(gap.root_thread_id)} ${safeTurnLabel(gap.turn_id)}.`,
             ],
       };
     }
@@ -2025,6 +3060,7 @@ function appendLedgerGap(dataRoot, input, options = {}) {
       };
     }
 
+    const hookRollup = prepareHookRollupAppend(root, options);
     fs.mkdirSync(path.dirname(ledgerPath), {
       recursive: true,
       mode: 0o700,
@@ -2038,6 +3074,13 @@ function appendLedgerGap(dataRoot, input, options = {}) {
     } catch (error) {
       diagnostics.push(
         `Ledger read cache will be rebuilt: ${error.message}`,
+      );
+    }
+    try {
+      updateHookRollupAfterAppend(root, gap, hookRollup);
+    } catch (error) {
+      diagnostics.push(
+        `Hook rollup cache will be rebuilt: ${error.message}`,
       );
     }
     return {
@@ -2649,6 +3692,7 @@ module.exports = {
   DEFAULT_SETTINGS: Object.freeze(defaultSettings()),
   DEFAULT_TIME_ZONE,
   EUR_NANOS,
+  HOOK_ROLLUP_SCHEMA,
   LEDGER_GAP_REASONS,
   LEDGER_SCHEMA,
   SETTINGS_SCHEMA,
@@ -2657,6 +3701,7 @@ module.exports = {
   appendLedgerGap,
   appendLedgerRecord,
   budgetState,
+  buildHookRollup,
   buildSnapshot,
   crossedBudgetThresholds,
   crossedThresholds,
@@ -2667,6 +3712,7 @@ module.exports = {
   formatEuroNanos,
   formatTokens,
   hasUsage,
+  hookRollupCachePath,
   ledgerPathFor,
   loadSettings,
   localDateParts,

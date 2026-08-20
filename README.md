@@ -179,25 +179,39 @@ starts at installation, the forecast does not include earlier spending.
 The monthly JSONL ledger is the source of truth. It stores one compact record
 per completed root user-to-assistant turn. A turn with subagents is still one
 ledger line; model and root-versus-subagent totals are nested breakdowns.
-There is no ledger row for each tool call.
+There is no ledger row for each tool call. Each UTC month has one canonical
+`PLUGIN_DATA/usage/YYYY-MM/turns.jsonl` source file, regardless of how many
+sessions were active. Development-era `task-*.jsonl` files are ignored.
 
 If a post-install turn cannot be traversed or priced exactly, the ledger stores
-only a metadata gap marker. Affected current-period totals remain unavailable
-instead of silently omitting that turn.
+an unresolved gap marker. When usable token counters are already available,
+the marker also preserves that known usage and cost. The hook labels affected
+turn, session, day, and month totals as lower bounds with a pending-turn count;
+it never presents an incomplete value as exact.
 
-Rebuildable hook caches store only rollout metadata, task boundaries, lineage,
-and token-counter events needed for incremental accounting. They avoid
-re-reading unchanged transcript history. The dashboard reads the compact
-ledger and never parses Codex transcripts.
+At Stop, the hook reads only the current root turn and the direct or transitive
+subagent rollouts associated with that turn. It does not scan unrelated or
+historical rollout files to reconstruct session totals. One compact ledger line
+then represents the entire root turn, regardless of the number of tool calls or
+subagents.
+
+A small rebuildable hook rollup is updated atomically with each ledger write.
+It provides current-session, local-day, and local-month totals directly from
+the compact ledger. A missing or corrupt rollup is rebuilt from those compact
+turn records in one pass, opening at most one ledger file per recorded UTC
+month rather than one file per session. It never requires a cold scan of Codex
+transcript history. Rebuildable per-rollout caches retain only the current
+accounting metadata needed for appended-byte and bounded-tail reads.
+
+The dashboard reads the compact ledger and never parses Codex transcripts.
 
 Ledger writes update a rebuildable compressed read index and a per-month
 generation marker. In-place edits made outside the plugin must also update that
-marker, or delete the read index, before cached totals are read again. File
-adds, removals, and replacements invalidate the month automatically. The Stop
-hook reads only the UTC months that can affect its current local-month and
-seven-day totals and rebuilds a large cold month in bounded batches across
-later Stops. It records each exact current turn while aggregate totals remain
-unavailable during warming. Dashboard views request the full ledger.
+marker, or delete the read index, before cached totals are read again. Removal
+and replacement of the canonical `turns.jsonl` invalidate the month
+automatically. Other JSONL files in a usage-month directory are not accounting
+sources. This general read index supports full dashboard views; it is not on
+the Stop hook's critical path.
 
 All settings, ledgers, locks, and caches remain below `PLUGIN_DATA`. Task labels
 shown in dashboards are local hashes; project paths and task titles are not
@@ -209,9 +223,10 @@ turn.
 
 ## Privacy
 
-The hook makes no network requests. It reads local Codex rollout JSONL files to
-extract token counters, model names, task boundaries, and subagent lineage. It
-does not persist prompts, responses, tool-output text, or full project paths.
+The hook makes no network requests. It reads the current turn's local Codex
+rollout JSONL files to extract token counters, model names, task boundaries,
+and subagent lineage. It does not persist prompts, responses, tool-output text,
+or full project paths.
 
 Parsed accounting metadata and aggregate usage records are stored in Codex's
 writable plugin data directory. Do not commit that runtime directory.
@@ -240,8 +255,9 @@ Historical ledger entries retain the conversion and calculated EUR amount used
 when they were recorded. Updating rates affects future turns only.
 
 The meter depends on Codex's local rollout format, which may change. Unknown
-models and incomplete agent traversal produce an unavailable or cache-warming
-message instead of a misleading numeric estimate.
+models and incomplete agent traversal produce a pending lower bound, or an
+unavailable current-turn amount when no trustworthy usage is known, instead of
+a misleading exact estimate.
 
 ## Development
 
