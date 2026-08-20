@@ -1446,17 +1446,15 @@ function analyze(hookInput) {
     }
   }
 
+  // Codex invokes the root Stop hook before it appends task_complete to the
+  // rollout. The matching Stop event is completion evidence for the current
+  // root task; token validity and subagent traversal still determine whether
+  // its accounting is exact.
   let turnComplete =
     currentTraversalComplete &&
-    Boolean(
-      currentRootTask &&
-        currentRootTask.completed &&
-        currentRootTask.exact,
-    );
+    Boolean(currentRootTask && currentRootTask.exact);
   if (!currentRootTask) {
     warnings.push('The current root task could not be found in its rollout.');
-  } else if (!currentRootTask.completed) {
-    warnings.push('The current root task was still open.');
   }
   for (const accounting of accountingByThread.values()) {
     for (const task of accounting.tasks.values()) {
@@ -1468,6 +1466,10 @@ function analyze(hookInput) {
 
   const turnUsage = usageForSegments(turnSegments);
   const sessionUsage = usageForSegments(sessionSegments);
+  const lastTurnUsageMs = turnSegments.reduce(
+    (latest, segment) => Math.max(latest, segment.timestampMs),
+    Number.NEGATIVE_INFINITY,
+  );
   const turnPricing = priceSegments(turnSegments);
   const sessionPricing = priceSegments(sessionSegments);
   const breakdown = turnBreakdown(turnSegments, turnAgentThreadIds.size);
@@ -1512,9 +1514,10 @@ function analyze(hookInput) {
       rootSessionId,
       turnId: currentTurnId,
       completedAtMs:
+        (Number.isFinite(lastTurnUsageMs) ? lastTurnUsageMs : null) ??
         currentRootTask?.completedMs ??
-        currentRootTask?.startedMs ??
-        rootParsed.lastTimestampMs,
+        rootParsed.lastTimestampMs ??
+        currentRootTask?.startedMs,
     },
     warnings: [...new Set(warnings)],
   };

@@ -1,6 +1,6 @@
 {
   "name": "codex-cost-meter",
-  "version": "0.2.0",
+  "version": "0.2.0+codex.20260820175017",
   "description": "Display local Codex usage, estimated EUR costs, budgets, and dashboards.",
   "author": {
     "name": "Codex Cost Meter contributors"

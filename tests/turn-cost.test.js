@@ -445,7 +445,7 @@ test('records a gap instead of a false zero-cost turn without token evidence', (
   assert.equal(entries[0].reason, 'usage_unavailable');
 });
 
-test('does not finalize a current root task before task_complete is present', () => {
+test('records a current root turn when Stop precedes task_complete', () => {
   const fixtureRoot = fs.mkdtempSync(
     path.join(os.tmpdir(), 'turn-cost-open-root-'),
   );
@@ -470,15 +470,23 @@ test('does not finalize a current root task before task_complete is present', ()
     tokenRecord(1_000_100, rootUsage, rootUsage),
   ]);
 
+  const debug = invoke(rootPath, rootId, rootTurn);
+  assert.equal(debug.status, 0, debug.stderr);
+  const result = JSON.parse(debug.stdout);
+  assert.equal(result.turnComplete, true);
+  assert.equal(result.ledgerContext.completedAtMs, 1_000_100);
+
   const invocation = invoke(rootPath, rootId, rootTurn, false, {
     PLUGIN_DATA: pluginData,
   });
   assert.equal(invocation.status, 0, invocation.stderr);
-  assert.equal(
-    JSON.parse(invocation.stdout).systemMessage,
-    'Usage unavailable — see hook diagnostics.',
+  const message = JSON.parse(invocation.stdout).systemMessage.replaceAll(
+    '\u00a0',
+    ' ',
   );
-  assert.match(invocation.stderr, /current root task was still open/i);
+  assert.match(message, /Turn \+ agents 110 tok · €0\.00065/);
+  assert.match(message, /Session \+ agents 110 tok · €0\.00065/);
+  assert.match(message, /Today €0\.00065/);
 
   const entries = readLedgerForRoot(
     path.join(pluginData, 'usage'),
@@ -486,8 +494,8 @@ test('does not finalize a current root task before task_complete is present', ()
     rootId,
   );
   assert.equal(entries.length, 1);
-  assert.equal(entries[0].entry_type, 'gap');
-  assert.equal(entries[0].reason, 'history_incomplete');
+  assert.equal(entries[0].entry_type, undefined);
+  assert.equal(entries[0].turn_id, rootTurn);
 });
 
 test('does not record a hook turn id absent from the root rollout', () => {
@@ -926,7 +934,7 @@ test('forks use their new root id and never rebill inherited history', () => {
   assert.equal(forkRecords[0].cost_eur_nanos, 1_811_250);
 });
 
-test('uses the stable turn completion month when the same Stop is retried', () => {
+test('uses a stable final-token timestamp when Stop precedes task_complete', () => {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'turn-cost-month-'));
   const sessionsDay = path.join(
     fixtureRoot,
@@ -954,11 +962,6 @@ test('uses the stable turn completion month when the same Stop is retried', () =
     taskStarted(augustStart, augustTurn),
     turnContext(augustStart + 10, augustTurn),
     tokenRecord(augustStart + 100, augustUsage, augustUsage),
-    taskComplete(augustComplete, augustTurn),
-    taskStarted(septemberStart, septemberTurn),
-    turnContext(septemberStart + 10, septemberTurn),
-    tokenRecord(septemberStart + 100, cumulative, septemberUsage),
-    taskComplete(septemberComplete, septemberTurn),
   ]);
   const environment = {
     CODEX_TURN_COST_NOW: '',
@@ -966,6 +969,17 @@ test('uses the stable turn completion month when the same Stop is retried', () =
 
   const first = invoke(rootPath, rootId, augustTurn, false, environment);
   assert.equal(first.status, 0, first.stderr);
+  fs.appendFileSync(
+    rootPath,
+    `${[
+      taskComplete(augustComplete, augustTurn),
+      taskStarted(septemberStart, septemberTurn),
+      turnContext(septemberStart + 10, septemberTurn),
+      tokenRecord(septemberStart + 100, cumulative, septemberUsage),
+      taskComplete(septemberComplete, septemberTurn),
+    ].join('\n')}\n`,
+    'utf8',
+  );
   const second = invoke(rootPath, rootId, septemberTurn, false, environment);
   assert.equal(second.status, 0, second.stderr);
   const duplicate = invoke(rootPath, rootId, augustTurn, false, environment);
@@ -981,12 +995,12 @@ test('uses the stable turn completion month when the same Stop is retried', () =
   assert.ok(augustRecord);
   assert.equal(
     augustRecord.completed_at,
-    new Date(augustComplete).toISOString(),
+    new Date(augustStart + 100).toISOString(),
   );
   assert.ok(septemberRecord);
   assert.equal(
     septemberRecord.completed_at,
-    new Date(septemberComplete).toISOString(),
+    new Date(septemberStart + 100).toISOString(),
   );
   assert.equal(fs.existsSync(path.join(usageRoot, '2026-09')), false);
 });
