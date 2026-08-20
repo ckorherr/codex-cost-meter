@@ -651,6 +651,19 @@ function writeFragment(outputPath, fragment) {
   return byteLength + 1;
 }
 
+function visualizationReferencePath(outputPath, environment = process.env) {
+  const normalizedInput = String(outputPath).replaceAll('\\', '/');
+  if (environment.WSL_DISTRO_NAME) {
+    const mountedWindowsPath =
+      /^\/mnt\/([A-Za-z])(?:\/(.*))?$/.exec(normalizedInput);
+    if (mountedWindowsPath) {
+      const [, drive, remainder = ''] = mountedWindowsPath;
+      return `${drive.toUpperCase()}:/${remainder}`;
+    }
+  }
+  return path.resolve(outputPath);
+}
+
 function renderDashboardFragment(options = {}) {
   if (
     typeof options.outputPath !== 'string' ||
@@ -690,7 +703,7 @@ function main(argv = process.argv.slice(2)) {
     return;
   }
   const result = renderDashboardFragment(options);
-  process.stdout.write(`${result.outputPath}\n`);
+  process.stdout.write(`${visualizationReferencePath(result.outputPath)}\n`);
 }
 
 if (require.main === module) {
@@ -709,4 +722,5 @@ module.exports = {
   parseArguments,
   renderDashboardFragment,
   renderFragment,
+  visualizationReferencePath,
 };
