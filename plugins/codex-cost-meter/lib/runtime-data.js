@@ -1745,7 +1745,10 @@ function acquireLedgerLock(lockPath, timeoutMessage) {
       fs.writeFileSync(descriptor, `${process.pid}\n`, 'utf8');
       return { descriptor, lockPath };
     } catch (error) {
-      if (error?.code !== 'EEXIST') {
+      // Windows can briefly report EPERM instead of EEXIST while another
+      // process is deleting a lock file. Treat both as bounded contention;
+      // the stat below still surfaces unrelated filesystem errors.
+      if (error?.code !== 'EEXIST' && error?.code !== 'EPERM') {
         throw error;
       }
       try {

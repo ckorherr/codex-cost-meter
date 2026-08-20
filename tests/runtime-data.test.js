@@ -1226,6 +1226,35 @@ test('waits beyond one second for a concurrent ledger writer', (t) => {
   assert.ok(Date.now() - started >= 1_000);
 });
 
+test('retries a transient permission error while acquiring a ledger lock', (t) => {
+  const dataRoot = temporaryData(t);
+  const originalOpenSync = fs.openSync;
+  let injected = false;
+  fs.openSync = function openSyncWithTransientLockError(filePath, flags, mode) {
+    if (
+      !injected &&
+      flags === 'wx' &&
+      path.basename(filePath) === '.ledger-write.lock'
+    ) {
+      injected = true;
+      const error = new Error('transient Windows lock contention');
+      error.code = 'EPERM';
+      throw error;
+    }
+    return originalOpenSync.call(fs, filePath, flags, mode);
+  };
+  t.after(() => {
+    fs.openSync = originalOpenSync;
+  });
+
+  const appended = runtime.appendLedgerRecord(
+    dataRoot,
+    ledgerRecord({ turn_id: 'after-transient-eperm' }),
+  );
+  assert.equal(injected, true);
+  assert.equal(appended.recorded, true);
+});
+
 test('rebuilds a corrupt ledger cache and detects source-file replacement', (t) => {
   const dataRoot = temporaryData(t);
   const first = runtime.appendLedgerRecord(
