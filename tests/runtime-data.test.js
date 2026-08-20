@@ -1038,7 +1038,7 @@ test('incremental ledger cache skips unchanged files and detects appends, additi
     'cache',
     'ledger-read-v3.json.gz',
   );
-  if ((fs.statSync(dataRoot).mode & 0o777) !== 0o777) {
+  if (process.platform !== 'win32' && (fs.statSync(dataRoot).mode & 0o777) !== 0o777) {
     assert.equal(fs.statSync(cachePath).mode & 0o777, 0o600);
   }
   assert.equal(
