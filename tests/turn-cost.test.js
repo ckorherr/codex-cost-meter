@@ -59,6 +59,20 @@ function tokenRecord(milliseconds, total, last) {
   });
 }
 
+function malformedTokenRecord(milliseconds) {
+  return record(milliseconds, 'event_msg', {
+    type: 'token_count',
+    info: {
+      total_token_usage: {
+        ...usage(200, 20, 10, 20),
+        input_tokens: '200',
+      },
+      last_token_usage: usage(100, 10, 5, 10),
+      model_context_window: 258400,
+    },
+  });
+}
+
 function sessionMeta(
   milliseconds,
   id,
@@ -102,10 +116,10 @@ function taskComplete(milliseconds, id) {
   });
 }
 
-function turnContext(milliseconds, id) {
+function turnContext(milliseconds, id, model = 'gpt-5.6-sol') {
   return record(milliseconds, 'turn_context', {
     turn_id: id,
-    model: 'gpt-5.6-sol',
+    model,
   });
 }
 
@@ -149,7 +163,6 @@ function invoke(
       env: {
         ...process.env,
         CODEX_TURN_COST_NOW: '2026-08-20T12:00:00.000Z',
-        CODEX_TURN_COST_TIME_ZONE: 'UTC',
         ...extraEnvironment,
       },
     },
@@ -162,6 +175,26 @@ function readJsonl(filePath) {
     .split(/\r?\n/)
     .filter(Boolean)
     .map((line) => JSON.parse(line));
+}
+
+function readLedgerForRoot(usageRoot, month, rootThreadId) {
+  const monthDirectory = path.join(usageRoot, month);
+  return fs
+    .readdirSync(monthDirectory, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.jsonl'))
+    .flatMap((entry) => readJsonl(path.join(monthDirectory, entry.name)))
+    .filter((record) => record.root_thread_id === rootThreadId);
+}
+
+function defaultUsageRoot(fixtureRoot) {
+  return path.join(
+    fixtureRoot,
+    '.codex',
+    'plugins',
+    'data',
+    'codex-cost-meter-cost-meter',
+    'usage',
+  );
 }
 
 test('aggregates root, child, nested child, duplicates, and follow-up tasks', () => {
@@ -266,6 +299,52 @@ test('aggregates root, child, nested child, duplicates, and follow-up tasks', ()
   );
 });
 
+test('prices the current turn even when an earlier session turn is unpriced', () => {
+  const fixtureRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'turn-cost-mixed-pricing-'),
+  );
+  const sessionsDay = path.join(
+    fixtureRoot,
+    '.codex',
+    'sessions',
+    '2026',
+    '08',
+    '20',
+  );
+  fs.mkdirSync(sessionsDay, { recursive: true });
+
+  const rootId = 'mixed-pricing-root';
+  const unknownTurn = 'unknown-turn';
+  const knownTurn = 'known-turn';
+  const unknownUsage = usage(100, 0, 0, 10);
+  const knownUsage = usage(200, 50, 0, 20);
+  const rootPath = writeRollout(sessionsDay, rootId, [
+    sessionMeta(1_000_000, rootId, rootId),
+    taskStarted(1_000_000, unknownTurn),
+    turnContext(1_000_010, unknownTurn, 'future-model'),
+    tokenRecord(1_000_100, unknownUsage, unknownUsage),
+    taskComplete(1_010_000, unknownTurn),
+    taskStarted(2_000_000, knownTurn),
+    turnContext(2_000_010, knownTurn),
+    tokenRecord(
+      2_000_100,
+      add(unknownUsage, knownUsage),
+      knownUsage,
+    ),
+    taskComplete(2_010_000, knownTurn),
+  ]);
+
+  const invocation = invoke(rootPath, rootId, knownTurn);
+  assert.equal(invocation.status, 0, invocation.stderr);
+  const result = JSON.parse(invocation.stdout);
+  assert.equal(result.turnPriced, true);
+  assert.equal(result.sessionPriced, false);
+  assert.equal(result.priced, false);
+  assert.equal(result.turn.usage.total_tokens, knownUsage.total_tokens);
+  assert.ok(result.turn.cost > 0);
+  assert.match(result.warnings.join('\n'), /future-model/);
+});
+
 test('does not present partial totals while a child task is still open', () => {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'turn-cost-open-'));
   const sessionsDay = path.join(
@@ -312,9 +391,389 @@ test('does not present partial totals while a child task is still open', () => {
     'Usage unavailable — see hook diagnostics.',
   );
   assert.match(invocation.stderr, /still open/);
+  const entries = readLedgerForRoot(
+    defaultUsageRoot(fixtureRoot),
+    '2026-08',
+    rootId,
+  );
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].entry_type, 'gap');
+  assert.equal(entries[0].reason, 'history_incomplete');
+});
+
+test('records a gap instead of a false zero-cost turn without token evidence', () => {
+  const fixtureRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'turn-cost-no-tokens-'),
+  );
+  const pluginData = path.join(fixtureRoot, 'plugin-data');
+  const sessionsDay = path.join(
+    fixtureRoot,
+    '.codex',
+    'sessions',
+    '2026',
+    '08',
+    '20',
+  );
+  fs.mkdirSync(sessionsDay, { recursive: true });
+
+  const rootId = 'no-token-root';
+  const rootTurn = 'no-token-turn';
+  const rootPath = writeRollout(sessionsDay, rootId, [
+    sessionMeta(1_000_000, rootId, rootId),
+    taskStarted(1_000_000, rootTurn),
+    turnContext(1_000_010, rootTurn),
+    taskComplete(1_010_000, rootTurn),
+  ]);
+
+  const invocation = invoke(rootPath, rootId, rootTurn, false, {
+    PLUGIN_DATA: pluginData,
+  });
+  assert.equal(invocation.status, 0, invocation.stderr);
   assert.equal(
-    fs.existsSync(path.join(fixtureRoot, '.codex', 'usage')),
+    JSON.parse(invocation.stdout).systemMessage,
+    'Usage unavailable — see hook diagnostics.',
+  );
+  assert.match(invocation.stderr, /without a usable token counter/);
+
+  const entries = readLedgerForRoot(
+    path.join(pluginData, 'usage'),
+    '2026-08',
+    rootId,
+  );
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].entry_type, 'gap');
+  assert.equal(entries[0].reason, 'usage_unavailable');
+});
+
+test('does not finalize a current root task before task_complete is present', () => {
+  const fixtureRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'turn-cost-open-root-'),
+  );
+  const pluginData = path.join(fixtureRoot, 'plugin-data');
+  const sessionsDay = path.join(
+    fixtureRoot,
+    '.codex',
+    'sessions',
+    '2026',
+    '08',
+    '20',
+  );
+  fs.mkdirSync(sessionsDay, { recursive: true });
+
+  const rootId = 'open-root';
+  const rootTurn = 'open-root-turn';
+  const rootUsage = usage(100, 20, 10, 10);
+  const rootPath = writeRollout(sessionsDay, rootId, [
+    sessionMeta(1_000_000, rootId, rootId),
+    taskStarted(1_000_000, rootTurn),
+    turnContext(1_000_010, rootTurn),
+    tokenRecord(1_000_100, rootUsage, rootUsage),
+  ]);
+
+  const invocation = invoke(rootPath, rootId, rootTurn, false, {
+    PLUGIN_DATA: pluginData,
+  });
+  assert.equal(invocation.status, 0, invocation.stderr);
+  assert.equal(
+    JSON.parse(invocation.stdout).systemMessage,
+    'Usage unavailable — see hook diagnostics.',
+  );
+  assert.match(invocation.stderr, /current root task was still open/i);
+
+  const entries = readLedgerForRoot(
+    path.join(pluginData, 'usage'),
+    '2026-08',
+    rootId,
+  );
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].entry_type, 'gap');
+  assert.equal(entries[0].reason, 'history_incomplete');
+});
+
+test('does not record a hook turn id absent from the root rollout', () => {
+  const fixtureRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'turn-cost-missing-turn-'),
+  );
+  const pluginData = path.join(fixtureRoot, 'plugin-data');
+  const sessionsDay = path.join(
+    fixtureRoot,
+    '.codex',
+    'sessions',
+    '2026',
+    '08',
+    '20',
+  );
+  fs.mkdirSync(sessionsDay, { recursive: true });
+
+  const rootId = 'missing-turn-root';
+  const recordedTurn = 'recorded-turn';
+  const missingTurn = 'missing-turn';
+  const rootUsage = usage(100, 20, 10, 10);
+  const rootPath = writeRollout(sessionsDay, rootId, [
+    sessionMeta(1_000_000, rootId, rootId),
+    taskStarted(1_000_000, recordedTurn),
+    turnContext(1_000_010, recordedTurn),
+    tokenRecord(1_000_100, rootUsage, rootUsage),
+    taskComplete(1_010_000, recordedTurn),
+  ]);
+
+  const invocation = invoke(rootPath, rootId, missingTurn, false, {
+    PLUGIN_DATA: pluginData,
+  });
+  assert.equal(invocation.status, 0, invocation.stderr);
+  assert.equal(
+    JSON.parse(invocation.stdout).systemMessage,
+    'Usage unavailable — see hook diagnostics.',
+  );
+  assert.match(invocation.stderr, /current root task could not be found/i);
+
+  const entries = readLedgerForRoot(
+    path.join(pluginData, 'usage'),
+    '2026-08',
+    rootId,
+  );
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].entry_type, 'gap');
+  assert.equal(entries[0].turn_id, missingTurn);
+  assert.equal(entries[0].reason, 'usage_unavailable');
+});
+
+test('treats a malformed token counter as incomplete accounting', () => {
+  const fixtureRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'turn-cost-malformed-tokens-'),
+  );
+  const pluginData = path.join(fixtureRoot, 'plugin-data');
+  const sessionsDay = path.join(
+    fixtureRoot,
+    '.codex',
+    'sessions',
+    '2026',
+    '08',
+    '20',
+  );
+  fs.mkdirSync(sessionsDay, { recursive: true });
+
+  const rootId = 'malformed-token-root';
+  const rootTurn = 'malformed-token-turn';
+  const firstUsage = usage(100, 20, 10, 10);
+  const rootPath = writeRollout(sessionsDay, rootId, [
+    sessionMeta(1_000_000, rootId, rootId),
+    taskStarted(1_000_000, rootTurn),
+    turnContext(1_000_010, rootTurn),
+    tokenRecord(1_000_100, firstUsage, firstUsage),
+    malformedTokenRecord(1_000_200),
+    taskComplete(1_010_000, rootTurn),
+  ]);
+
+  const invocation = invoke(rootPath, rootId, rootTurn, false, {
+    PLUGIN_DATA: pluginData,
+  });
+  assert.equal(invocation.status, 0, invocation.stderr);
+  assert.equal(
+    JSON.parse(invocation.stdout).systemMessage,
+    'Usage unavailable — see hook diagnostics.',
+  );
+  assert.match(invocation.stderr, /Malformed token counter/);
+
+  const entries = readLedgerForRoot(
+    path.join(pluginData, 'usage'),
+    '2026-08',
+    rootId,
+  );
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].entry_type, 'gap');
+  assert.equal(entries[0].reason, 'history_incomplete');
+});
+
+test('records an exact current turn after an earlier empty task', () => {
+  const fixtureRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'turn-cost-prior-empty-'),
+  );
+  const pluginData = path.join(fixtureRoot, 'plugin-data');
+  const sessionsDay = path.join(
+    fixtureRoot,
+    '.codex',
+    'sessions',
+    '2026',
+    '08',
+    '20',
+  );
+  fs.mkdirSync(sessionsDay, { recursive: true });
+
+  const rootId = 'prior-empty-root';
+  const emptyTurn = 'empty-turn';
+  const currentTurn = 'current-turn';
+  const currentUsage = usage(200, 50, 0, 20);
+  const rootPath = writeRollout(sessionsDay, rootId, [
+    sessionMeta(1_000_000, rootId, rootId),
+    taskStarted(1_000_000, emptyTurn),
+    turnContext(1_000_010, emptyTurn),
+    taskComplete(1_010_000, emptyTurn),
+    taskStarted(2_000_000, currentTurn),
+    turnContext(2_000_010, currentTurn),
+    tokenRecord(2_000_100, currentUsage, currentUsage),
+    taskComplete(2_010_000, currentTurn),
+  ]);
+
+  const debug = invoke(rootPath, rootId, currentTurn);
+  assert.equal(debug.status, 0, debug.stderr);
+  const result = JSON.parse(debug.stdout);
+  assert.equal(result.turnComplete, true);
+  assert.equal(result.sessionComplete, false);
+  assert.equal(result.turn.usage.total_tokens, 220);
+
+  const invocation = invoke(rootPath, rootId, currentTurn, false, {
+    PLUGIN_DATA: pluginData,
+  });
+  assert.equal(invocation.status, 0, invocation.stderr);
+  const message = JSON.parse(invocation.stdout).systemMessage.replaceAll(
+    '\u00a0',
+    ' ',
+  );
+  assert.match(message, /Turn \+ agents 220 tok · €0\.00124/);
+  assert.match(message, /Session \+ agents unavailable/);
+  assert.match(message, /Today €0\.00124/);
+
+  const entries = readLedgerForRoot(
+    path.join(pluginData, 'usage'),
+    '2026-08',
+    rootId,
+  );
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].entry_type, undefined);
+  assert.equal(entries[0].turn_id, currentTurn);
+});
+
+test('records an accounting gap when analysis fails after root identity is known', () => {
+  const fixtureRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'turn-cost-fatal-gap-'),
+  );
+  const pluginData = path.join(fixtureRoot, 'plugin-data');
+  const sessionsDay = path.join(
+    fixtureRoot,
+    '.codex',
+    'sessions',
+    '2026',
+    '08',
+    '20',
+  );
+  fs.mkdirSync(sessionsDay, { recursive: true });
+
+  const rootId = 'fatal-gap-root';
+  const rootTurn = 'fatal-gap-turn';
+  const rootUsage = usage(100, 20, 10, 10);
+  const rootPath = writeRollout(sessionsDay, rootId, [
+    sessionMeta(1_000_000, rootId, rootId),
+    taskStarted(1_000_000, rootTurn),
+    turnContext(1_000_010, rootTurn, { unexpected: 'model-shape' }),
+    tokenRecord(1_000_100, rootUsage, rootUsage),
+    taskComplete(1_010_000, rootTurn),
+  ]);
+
+  const invocation = invoke(rootPath, rootId, rootTurn, false, {
+    PLUGIN_DATA: pluginData,
+  });
+  assert.equal(invocation.status, 0, invocation.stderr);
+  assert.equal(
+    JSON.parse(invocation.stdout).systemMessage,
+    'Usage unavailable for this turn.',
+  );
+  assert.match(invocation.stderr, /startsWith|model/);
+
+  const entries = readLedgerForRoot(
+    path.join(pluginData, 'usage'),
+    '2026-08',
+    rootId,
+  );
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].entry_type, 'gap');
+  assert.equal(entries[0].reason, 'accounting_error');
+});
+
+test('records an unpriced-turn gap and suppresses later partial aggregates', () => {
+  const fixtureRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'turn-cost-unpriced-gap-'),
+  );
+  const pluginData = path.join(fixtureRoot, 'plugin-data');
+  const environment = { PLUGIN_DATA: pluginData };
+  const sessionsDay = path.join(
+    fixtureRoot,
+    '.codex',
+    'sessions',
+    '2026',
+    '08',
+    '20',
+  );
+  fs.mkdirSync(sessionsDay, { recursive: true });
+
+  const rootId = 'unpriced-gap-root';
+  const unknownTurn = 'unpriced-turn';
+  const knownTurn = 'priced-turn';
+  const unknownUsage = usage(100, 0, 0, 10);
+  const knownUsage = usage(200, 50, 0, 20);
+  const rootPath = writeRollout(sessionsDay, rootId, [
+    sessionMeta(1_000_000, rootId, rootId),
+    taskStarted(1_000_000, unknownTurn),
+    turnContext(1_000_010, unknownTurn, 'future-model'),
+    tokenRecord(1_000_100, unknownUsage, unknownUsage),
+    taskComplete(1_010_000, unknownTurn),
+  ]);
+
+  const first = invoke(
+    rootPath,
+    rootId,
+    unknownTurn,
     false,
+    environment,
+  );
+  assert.equal(first.status, 0, first.stderr);
+  const firstMessage = JSON.parse(first.stdout).systemMessage.replaceAll(
+    '\u00a0',
+    ' ',
+  );
+  assert.match(firstMessage, /Turn \+ agents 110 tok · cost unavailable/);
+  assert.doesNotMatch(firstMessage, /Today|Aug €/);
+
+  const usageRoot = path.join(pluginData, 'usage');
+  let entries = readLedgerForRoot(usageRoot, '2026-08', rootId);
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].entry_type, 'gap');
+  assert.equal(entries[0].reason, 'pricing_unavailable');
+
+  fs.appendFileSync(
+    rootPath,
+    `${[
+      taskStarted(2_000_000, knownTurn),
+      turnContext(2_000_010, knownTurn),
+      tokenRecord(
+        2_000_100,
+        add(unknownUsage, knownUsage),
+        knownUsage,
+      ),
+      taskComplete(2_010_000, knownTurn),
+    ].join('\n')}\n`,
+    'utf8',
+  );
+
+  const second = invoke(rootPath, rootId, knownTurn, false, environment);
+  assert.equal(second.status, 0, second.stderr);
+  const secondMessage = JSON.parse(second.stdout).systemMessage.replaceAll(
+    '\u00a0',
+    ' ',
+  );
+  assert.match(secondMessage, /Turn \+ agents 220 tok · €0\.00124/);
+  assert.doesNotMatch(secondMessage, /Today|Aug €/);
+  assert.match(second.stderr, /aggregate totals were suppressed/);
+
+  entries = readLedgerForRoot(usageRoot, '2026-08', rootId);
+  assert.equal(entries.length, 2);
+  assert.equal(
+    entries.filter((entry) => entry.entry_type === 'gap').length,
+    1,
+  );
+  assert.equal(
+    entries.filter((entry) => entry.turn_id === knownTurn).length,
+    1,
   );
 });
 
@@ -358,21 +817,22 @@ test('records exact root turns once and totals the current day and month in EUR'
   assert.doesNotMatch(firstMessage, /\$/);
   assert.equal((firstMessage.match(/\n/g) ?? []).length, 1);
 
-  const ledgerPath = path.join(
-    pluginData,
-    'usage',
-    '2026-08',
-    `${rootId}.jsonl`,
-  );
-  let records = readJsonl(ledgerPath);
+  const usageRoot = path.join(pluginData, 'usage');
+  let records = readLedgerForRoot(usageRoot, '2026-08', rootId);
   assert.equal(records.length, 1);
+  assert.equal(records[0].schema, 2);
   assert.equal(records[0].turn_id, turnOne);
   assert.equal(records[0].cost_eur_nanos, 5_692_500);
   assert.equal(records[0].eur_per_usd, 0.9);
+  assert.equal(records[0].model_breakdown.length, 1);
+  assert.equal(
+    records[0].agent_breakdown.root.cost_eur_nanos,
+    records[0].cost_eur_nanos,
+  );
 
   const duplicate = invoke(rootPath, rootId, turnOne, false, environment);
   assert.equal(duplicate.status, 0, duplicate.stderr);
-  assert.equal(readJsonl(ledgerPath).length, 1);
+  assert.equal(readLedgerForRoot(usageRoot, '2026-08', rootId).length, 1);
 
   fs.appendFileSync(
     rootPath,
@@ -395,7 +855,7 @@ test('records exact root turns once and totals the current day and month in EUR'
   assert.match(secondMessage, /Today €0\.00693/);
   assert.match(secondMessage, /Aug €0\.00693/);
 
-  records = readJsonl(ledgerPath);
+  records = readLedgerForRoot(usageRoot, '2026-08', rootId);
   assert.equal(records.length, 2);
   assert.equal(records[1].turn_id, turnTwo);
   assert.equal(records[1].cost_eur_nanos, 1_237_500);
@@ -454,14 +914,9 @@ test('forks use their new root id and never rebill inherited history', () => {
   assert.match(forkMessage, /Session \+ agents 330 tok · €0\.00181/);
   assert.match(forkMessage, /Today €0\.00750/);
 
-  const ledgerDirectory = path.join(
-    fixtureRoot,
-    '.codex',
-    'usage',
-    '2026-08',
-  );
-  const sourceRecords = readJsonl(path.join(ledgerDirectory, `${sourceId}.jsonl`));
-  const forkRecords = readJsonl(path.join(ledgerDirectory, `${forkId}.jsonl`));
+  const usageRoot = defaultUsageRoot(fixtureRoot);
+  const sourceRecords = readLedgerForRoot(usageRoot, '2026-08', sourceId);
+  const forkRecords = readLedgerForRoot(usageRoot, '2026-08', forkId);
   assert.equal(sourceRecords.length, 1);
   assert.equal(forkRecords.length, 1);
   assert.equal(forkRecords[0].root_thread_id, forkId);
@@ -507,7 +962,6 @@ test('uses the stable turn completion month when the same Stop is retried', () =
   ]);
   const environment = {
     CODEX_TURN_COST_NOW: '',
-    CODEX_TURN_COST_TIME_ZONE: 'Europe/Berlin',
   };
 
   const first = invoke(rootPath, rootId, augustTurn, false, environment);
@@ -517,17 +971,22 @@ test('uses the stable turn completion month when the same Stop is retried', () =
   const duplicate = invoke(rootPath, rootId, augustTurn, false, environment);
   assert.equal(duplicate.status, 0, duplicate.stderr);
 
-  const usageRoot = path.join(fixtureRoot, '.codex', 'usage');
-  const augustRecords = readJsonl(
-    path.join(usageRoot, '2026-08', `${rootId}.jsonl`),
+  const usageRoot = defaultUsageRoot(fixtureRoot);
+  const records = readLedgerForRoot(usageRoot, '2026-08', rootId);
+  assert.equal(records.length, 2);
+  const augustRecord = records.find((record) => record.turn_id === augustTurn);
+  const septemberRecord = records.find(
+    (record) => record.turn_id === septemberTurn,
   );
-  const septemberRecords = readJsonl(
-    path.join(usageRoot, '2026-09', `${rootId}.jsonl`),
+  assert.ok(augustRecord);
+  assert.equal(
+    augustRecord.completed_at,
+    new Date(augustComplete).toISOString(),
   );
-  assert.equal(augustRecords.length, 1);
-  assert.equal(augustRecords[0].turn_id, augustTurn);
-  assert.equal(augustRecords[0].local_date, '2026-08-31');
-  assert.equal(septemberRecords.length, 1);
-  assert.equal(septemberRecords[0].turn_id, septemberTurn);
-  assert.equal(septemberRecords[0].local_date, '2026-09-01');
+  assert.ok(septemberRecord);
+  assert.equal(
+    septemberRecord.completed_at,
+    new Date(septemberComplete).toISOString(),
+  );
+  assert.equal(fs.existsSync(path.join(usageRoot, '2026-09')), false);
 });

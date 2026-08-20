@@ -1,14 +1,28 @@
 'use strict';
 
 // Portable Stop hook bundled with the Codex Cost Meter plugin.
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { performance } = require('node:perf_hooks');
+const { spawn } = require('node:child_process');
+const {
+  readSessionMetadata,
+  buildSessionFileIndex,
+  findChildMetadata,
+} = require('../lib/session-index');
+const {
+  appendLedgerGap,
+  appendLedgerRecord,
+  buildSnapshot,
+  crossedBudgetThresholds,
+  loadSettings,
+  resolveDataRoot,
+} = require('../lib/runtime-data');
 
 const PRICING_AS_OF = '2026-08-20';
 const EUR_PER_USD = 0.9;
-const LEDGER_SCHEMA = 1;
-const CACHE_VERSION = 1;
+const CACHE_VERSION = 5;
 const ANALYSIS_BUDGET_MS = 7_500;
 const PRICE_PER_MILLION = {
   'gpt-5.6-sol': {
@@ -53,6 +67,20 @@ function normalizeUsage(value) {
   for (const key of USAGE_KEYS) {
     const number = Number(value[key] ?? 0);
     normalized[key] = Number.isFinite(number) && number >= 0 ? number : 0;
+  }
+  return normalized;
+}
+
+function exactUsage(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const normalized = {};
+  for (const key of USAGE_KEYS) {
+    if (!Number.isSafeInteger(value[key]) || value[key] < 0) {
+      return null;
+    }
+    normalized[key] = value[key];
   }
   return normalized;
 }
@@ -153,257 +181,230 @@ function findSessionsRoot(transcriptPath) {
   }
 }
 
-function listJsonlFiles(root) {
-  const files = [];
-  const pending = [root];
-
-  while (pending.length > 0) {
-    const directory = pending.pop();
-    let entries;
-    try {
-      entries = fs.readdirSync(directory, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-
-    for (const entry of entries) {
-      const fullPath = path.join(directory, entry.name);
-      if (entry.isDirectory()) {
-        pending.push(fullPath);
-      } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
-        files.push(fullPath);
-      }
-    }
-  }
-
-  return files;
+function emptyParsedRollout(filePath) {
+  return {
+    filePath,
+    firstMetadata: null,
+    taskStarts: [],
+    taskIds: new Set(),
+    tokenEvents: [],
+    invalidTokenEvents: [],
+    activities: [],
+    lastTimestampMs: 0,
+    currentModel: null,
+    turnModels: new Map(),
+    nextLineIndex: 0,
+    offset: 0,
+  };
 }
 
-function readFirstLine(filePath) {
-  const descriptor = fs.openSync(filePath, 'r');
-  const chunk = Buffer.allocUnsafe(64 * 1024);
-  const chunks = [];
-  let total = 0;
+function applyRolloutRecord(parsed, record, index) {
+  const payload = record.payload ?? {};
+  const timestampMs = parseTimestamp(record.timestamp);
+  parsed.lastTimestampMs = Math.max(parsed.lastTimestampMs, timestampMs);
 
-  try {
-    while (total < 4 * 1024 * 1024) {
-      const bytesRead = fs.readSync(descriptor, chunk, 0, chunk.length, null);
-      if (bytesRead === 0) {
-        break;
-      }
-      const piece = Buffer.from(chunk.subarray(0, bytesRead));
-      const newline = piece.indexOf(0x0a);
-      if (newline >= 0) {
-        chunks.push(piece.subarray(0, newline));
-        break;
-      }
-      chunks.push(piece);
-      total += bytesRead;
-    }
-  } finally {
-    fs.closeSync(descriptor);
-  }
-
-  return Buffer.concat(chunks).toString('utf8').replace(/^\uFEFF/, '').trim();
-}
-
-function readSessionMetadata(filePath) {
-  try {
-    const firstLine = readFirstLine(filePath);
-    if (!firstLine) {
-      return null;
-    }
-    const record = JSON.parse(firstLine);
-    if (record.type !== 'session_meta') {
-      return null;
-    }
-
-    const payload = record.payload ?? {};
-    const threadId = payload.id ?? null;
-    if (!threadId) {
-      return null;
-    }
-
+  if (!parsed.firstMetadata && record.type === 'session_meta') {
     const spawn = payload.source?.subagent?.thread_spawn;
-    return {
-      filePath,
-      threadId,
-      sessionId: payload.session_id ?? threadId,
+    parsed.firstMetadata = {
+      threadId: payload.id ?? null,
+      sessionId: payload.session_id ?? payload.id ?? null,
       forkedFromId: payload.forked_from_id ?? null,
       parentThreadId: spawn?.parent_thread_id ?? null,
-      depth: Number(spawn?.depth ?? 0),
       isSubagent: Boolean(spawn),
       startedMs: parseTimestamp(payload.timestamp ?? record.timestamp),
     };
-  } catch {
-    return null;
   }
-}
 
-function buildSessionFileIndex(sessionsRoot) {
-  const files = listJsonlFiles(sessionsRoot);
-  const byThreadId = new Map();
-  const threadIdPattern =
-    /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
-
-  for (const filePath of files) {
-    const match = threadIdPattern.exec(path.basename(filePath));
-    if (!match) {
-      continue;
+  if (record.type === 'turn_context') {
+    if (payload.model) {
+      parsed.currentModel = payload.model;
     }
-    const candidates = byThreadId.get(match[1]) ?? [];
-    candidates.push(filePath);
-    byThreadId.set(match[1], candidates);
-  }
-  return { files, byThreadId };
-}
-
-function findChildMetadata(fileIndex, threadId, parentThreadId, sessionId) {
-  const indexed = fileIndex.byThreadId.get(threadId);
-  const candidates =
-    indexed ??
-    fileIndex.files.filter((filePath) =>
-      path.basename(filePath).endsWith(`-${threadId}.jsonl`),
-    );
-
-  for (const filePath of candidates) {
-    const metadata = readSessionMetadata(filePath);
-    if (
-      metadata?.threadId === threadId &&
-      metadata.parentThreadId === parentThreadId &&
-      metadata.sessionId === sessionId
-    ) {
-      return metadata;
+    if (payload.turn_id && payload.model) {
+      parsed.turnModels.set(payload.turn_id, payload.model);
+      for (let taskIndex = parsed.taskStarts.length - 1; taskIndex >= 0; taskIndex -= 1) {
+        const task = parsed.taskStarts[taskIndex];
+        if (task.id === payload.turn_id) {
+          task.model = payload.model;
+          break;
+        }
+      }
     }
+    return;
   }
-  return null;
+
+  if (record.type !== 'event_msg') {
+    return;
+  }
+
+  if (payload.type === 'task_started' && payload.turn_id) {
+    parsed.taskStarts.push({
+      id: payload.turn_id,
+      index,
+      timestampMs,
+      startedMs: Number(payload.started_at ?? 0) * 1000 || timestampMs,
+      endIndex: Number.POSITIVE_INFINITY,
+      completed: false,
+      completedMs: null,
+      model: parsed.turnModels.get(payload.turn_id) ?? null,
+    });
+    parsed.taskIds.add(payload.turn_id);
+    return;
+  }
+
+  if (payload.type === 'task_complete' && payload.turn_id) {
+    for (let taskIndex = parsed.taskStarts.length - 1; taskIndex >= 0; taskIndex -= 1) {
+      const task = parsed.taskStarts[taskIndex];
+      if (
+        task.id === payload.turn_id &&
+        task.index < index &&
+        !Number.isFinite(task.endIndex)
+      ) {
+        task.endIndex = index;
+        task.completed = true;
+        task.completedMs = timestampMs;
+        break;
+      }
+    }
+    return;
+  }
+
+  if (payload.type === 'model_rerouted') {
+    parsed.currentModel =
+      payload.to_model ?? payload.toModel ?? parsed.currentModel;
+    return;
+  }
+
+  if (payload.type === 'token_count' && payload.info !== null && payload.info !== undefined) {
+    const total = exactUsage(payload.info.total_token_usage);
+    const last = exactUsage(payload.info.last_token_usage);
+    if (!total || !last) {
+      parsed.invalidTokenEvents.push({ index, timestampMs });
+      return;
+    }
+    parsed.tokenEvents.push({
+      index,
+      timestampMs,
+      total,
+      last,
+      model: parsed.currentModel,
+    });
+    return;
+  }
+
+  if (
+    payload.type === 'sub_agent_activity' &&
+    payload.agent_thread_id &&
+    ['started', 'interacted', 'interrupted'].includes(payload.kind)
+  ) {
+    parsed.activities.push({
+      index,
+      timestampMs,
+      occurredAtMs: Number(payload.occurred_at_ms ?? timestampMs),
+      childThreadId: payload.agent_thread_id,
+      kind: payload.kind,
+    });
+  }
 }
 
-function parseRollout(filePath) {
-  const lines = fs.readFileSync(filePath, 'utf8').split(/\r?\n/);
-  const taskStarts = [];
-  const taskCompletes = [];
-  const turnModels = new Map();
-  const tokenEvents = [];
-  const activities = [];
-  let firstMetadata = null;
-  let currentModel = null;
-  let lastTimestampMs = 0;
+function appendRolloutBytes(parsed, buffer) {
+  const lastNewline = buffer.lastIndexOf(0x0a);
+  const completeLength = lastNewline + 1;
+  const complete = buffer.subarray(0, completeLength).toString('utf8');
+  const lines = completeLength > 0 ? complete.split('\n') : [];
+  if (lines.length > 0) {
+    lines.pop();
+  }
 
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index].trim();
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\r$/, '').replace(/^\uFEFF/, '').trim();
     if (!line) {
       continue;
     }
 
-    let record;
+    const index = parsed.nextLineIndex;
+    parsed.nextLineIndex += 1;
     try {
-      record = JSON.parse(line);
+      applyRolloutRecord(parsed, JSON.parse(line), index);
     } catch {
-      // The final JSONL record can still be in flight while Stop executes.
-      continue;
-    }
-
-    const payload = record.payload ?? {};
-    const timestampMs = parseTimestamp(record.timestamp);
-    lastTimestampMs = Math.max(lastTimestampMs, timestampMs);
-
-    if (!firstMetadata && record.type === 'session_meta') {
-      const spawn = payload.source?.subagent?.thread_spawn;
-      firstMetadata = {
-        threadId: payload.id ?? null,
-        sessionId: payload.session_id ?? payload.id ?? null,
-        forkedFromId: payload.forked_from_id ?? null,
-        parentThreadId: spawn?.parent_thread_id ?? null,
-        isSubagent: Boolean(spawn),
-        startedMs: parseTimestamp(payload.timestamp ?? record.timestamp),
-      };
-    }
-
-    if (record.type === 'turn_context') {
-      if (payload.model) {
-        currentModel = payload.model;
-      }
-      if (payload.turn_id && payload.model) {
-        turnModels.set(payload.turn_id, payload.model);
-      }
-      continue;
-    }
-
-    if (record.type !== 'event_msg') {
-      continue;
-    }
-
-    if (payload.type === 'task_started' && payload.turn_id) {
-      taskStarts.push({
-        id: payload.turn_id,
-        index,
-        timestampMs,
-        startedMs: Number(payload.started_at ?? 0) * 1000 || timestampMs,
-      });
-      continue;
-    }
-
-    if (payload.type === 'task_complete' && payload.turn_id) {
-      taskCompletes.push({
-        id: payload.turn_id,
-        index,
-        timestampMs,
-      });
-      continue;
-    }
-
-    if (payload.type === 'model_rerouted') {
-      currentModel = payload.to_model ?? payload.toModel ?? currentModel;
-      continue;
-    }
-
-    if (payload.type === 'token_count' && payload.info?.total_token_usage) {
-      tokenEvents.push({
-        index,
-        timestampMs,
-        total: normalizeUsage(payload.info.total_token_usage),
-        last: normalizeUsage(payload.info.last_token_usage),
-        model: currentModel,
-      });
-      continue;
-    }
-
-    if (
-      payload.type === 'sub_agent_activity' &&
-      payload.agent_thread_id &&
-      ['started', 'interacted', 'interrupted'].includes(payload.kind)
-    ) {
-      activities.push({
-        index,
-        timestampMs,
-        occurredAtMs: Number(payload.occurred_at_ms ?? timestampMs),
-        childThreadId: payload.agent_thread_id,
-        kind: payload.kind,
-      });
+      // Ignore a malformed complete line without losing later records.
     }
   }
 
-  const taskIds = new Set(taskStarts.map((task) => task.id));
-  for (const task of taskStarts) {
-    const completion = taskCompletes.find(
-      (candidate) => candidate.id === task.id && candidate.index > task.index,
-    );
-    task.endIndex = completion?.index ?? Number.POSITIVE_INFINITY;
-    task.completed = Boolean(completion);
-    task.completedMs = completion?.timestampMs ?? null;
-    task.model = turnModels.get(task.id) ?? null;
+  const rawTail = buffer.subarray(completeLength).toString('utf8');
+  const tail = rawTail.replace(/\r$/, '').replace(/^\uFEFF/, '').trim();
+  if (!tail) {
+    return buffer.length;
   }
 
+  let record;
+  try {
+    record = JSON.parse(tail);
+  } catch {
+    // Keep an incomplete EOF record behind the offset for a later append.
+    return completeLength;
+  }
+
+  const index = parsed.nextLineIndex;
+  parsed.nextLineIndex += 1;
+  try {
+    applyRolloutRecord(parsed, record, index);
+  } catch {
+    // A syntactically complete but unsupported JSON record is still consumed.
+  }
+  return buffer.length;
+}
+
+function readRolloutTail(filePath, offset, size) {
+  const length = Math.max(0, size - offset);
+  if (length === 0) {
+    return Buffer.alloc(0);
+  }
+
+  const descriptor = fs.openSync(filePath, 'r');
+  const buffer = Buffer.allocUnsafe(length);
+  let position = 0;
+  try {
+    while (position < length) {
+      const bytesRead = fs.readSync(
+        descriptor,
+        buffer,
+        position,
+        length - position,
+        offset + position,
+      );
+      if (bytesRead === 0) {
+        break;
+      }
+      position += bytesRead;
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  return buffer.subarray(0, position);
+}
+
+function rolloutStat(filePath) {
+  const stat = fs.statSync(filePath, { bigint: true });
+  const size = Number(stat.size);
+  const mtimeMs = Number(stat.mtimeMs);
+  if (!Number.isSafeInteger(size) || !Number.isFinite(mtimeMs)) {
+    throw new RangeError('The rollout file metadata exceeds supported limits.');
+  }
   return {
-    filePath,
-    firstMetadata,
-    taskStarts,
-    taskIds,
-    tokenEvents,
-    activities,
-    lastTimestampMs,
+    size,
+    mtimeMs,
+    device: stat.dev.toString(),
+    inode: stat.ino.toString(),
+    birthtimeNs: stat.birthtimeNs.toString(),
   };
+}
+
+function parseRollout(filePath) {
+  const parsed = emptyParsedRollout(filePath);
+  const stat = rolloutStat(filePath);
+  const bytes = readRolloutTail(filePath, 0, stat.size);
+  parsed.offset = appendRolloutBytes(parsed, bytes);
+  return parsed;
 }
 
 function cachePathFor(cacheDirectory, threadId) {
@@ -411,68 +412,190 @@ function cachePathFor(cacheDirectory, threadId) {
   return path.join(cacheDirectory, `${safeThreadId}.json`);
 }
 
+function rolloutSourceKey(filePath) {
+  return crypto
+    .createHash('sha256')
+    .update(path.resolve(filePath), 'utf8')
+    .digest('hex');
+}
+
+function rolloutSourceIdentity(stat) {
+  return {
+    device: stat.device,
+    inode: stat.inode,
+    birthtimeNs: stat.birthtimeNs,
+  };
+}
+
+function sameRolloutSource(cached, filePath, stat) {
+  const expected = rolloutSourceIdentity(stat);
+  const observed = cached.sourceIdentity;
+  if (
+    cached.version !== CACHE_VERSION ||
+    cached.sourceKey !== rolloutSourceKey(filePath) ||
+    !observed ||
+    typeof observed !== 'object'
+  ) {
+    return false;
+  }
+  if (observed.inode !== '0' || expected.inode !== '0') {
+    return (
+      observed.device === expected.device &&
+      observed.inode === expected.inode
+    );
+  }
+  return observed.birthtimeNs === expected.birthtimeNs;
+}
+
+function compactUsage(usage) {
+  return USAGE_KEYS.map((key) => usage?.[key] ?? 0);
+}
+
+function expandUsage(values) {
+  return Object.fromEntries(
+    USAGE_KEYS.map((key, index) => [key, Number(values?.[index] ?? 0)]),
+  );
+}
+
 function serializeParsedRollout(parsed, stat) {
   return {
     version: CACHE_VERSION,
-    size: stat.size,
+    sourceKey: rolloutSourceKey(parsed.filePath),
+    sourceIdentity: rolloutSourceIdentity(stat),
+    sourceSize: stat.size,
     mtimeMs: Math.trunc(stat.mtimeMs),
+    offset: parsed.offset,
     parsed: {
       firstMetadata: parsed.firstMetadata,
-      taskStarts: parsed.taskStarts.map((task) => ({
-        ...task,
-        endIndex: Number.isFinite(task.endIndex) ? task.endIndex : null,
-      })),
-      tokenEvents: parsed.tokenEvents,
-      activities: parsed.activities,
+      taskStarts: parsed.taskStarts.map((task) => [
+        task.id,
+        task.index,
+        task.timestampMs,
+        task.startedMs,
+        Number.isFinite(task.endIndex) ? task.endIndex : null,
+        task.completed,
+        task.completedMs,
+        task.model,
+      ]),
+      tokenEvents: parsed.tokenEvents.map((event) => [
+        event.index,
+        event.timestampMs,
+        event.model,
+        compactUsage(event.total),
+        compactUsage(event.last),
+      ]),
+      invalidTokenEvents: parsed.invalidTokenEvents.map((event) => [
+        event.index,
+        event.timestampMs,
+      ]),
+      activities: parsed.activities.map((activity) => [
+        activity.index,
+        activity.timestampMs,
+        activity.occurredAtMs,
+        activity.childThreadId,
+        activity.kind,
+      ]),
       lastTimestampMs: parsed.lastTimestampMs,
+      currentModel: parsed.currentModel,
+      turnModels: [...parsed.turnModels.entries()],
+      nextLineIndex: parsed.nextLineIndex,
     },
   };
 }
 
 function hydrateParsedRollout(filePath, value) {
   const taskStarts = (value.taskStarts ?? []).map((task) => ({
-    ...task,
+    id: task[0],
+    index: task[1],
+    timestampMs: task[2],
+    startedMs: task[3],
     endIndex:
-      task.endIndex === null || task.endIndex === undefined
+      task[4] === null || task[4] === undefined
         ? Number.POSITIVE_INFINITY
-        : task.endIndex,
+        : task[4],
+    completed: task[5],
+    completedMs: task[6],
+    model: task[7],
   }));
   return {
     filePath,
     firstMetadata: value.firstMetadata ?? null,
     taskStarts,
     taskIds: new Set(taskStarts.map((task) => task.id)),
-    tokenEvents: value.tokenEvents ?? [],
-    activities: value.activities ?? [],
+    tokenEvents: (value.tokenEvents ?? []).map((event) => ({
+      index: event[0],
+      timestampMs: event[1],
+      model: event[2],
+      total: expandUsage(event[3]),
+      last: expandUsage(event[4]),
+    })),
+    invalidTokenEvents: (value.invalidTokenEvents ?? []).map((event) => ({
+      index: event[0],
+      timestampMs: event[1],
+    })),
+    activities: (value.activities ?? []).map((activity) => ({
+      index: activity[0],
+      timestampMs: activity[1],
+      occurredAtMs: activity[2],
+      childThreadId: activity[3],
+      kind: activity[4],
+    })),
     lastTimestampMs: value.lastTimestampMs ?? 0,
+    currentModel: value.currentModel ?? null,
+    turnModels: new Map(value.turnModels ?? []),
+    nextLineIndex: Number(value.nextLineIndex ?? 0),
+    offset: 0,
   };
 }
 
 function parseRolloutCached(filePath, threadId, cacheDirectory) {
-  const stat = fs.statSync(filePath);
+  const stat = rolloutStat(filePath);
   const cachePath = cachePathFor(cacheDirectory, threadId);
+  let parsed = null;
+  let cached = null;
 
   try {
-    const cached = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
-    if (
-      cached.version === CACHE_VERSION &&
-      cached.size === stat.size &&
-      cached.mtimeMs === Math.trunc(stat.mtimeMs)
-    ) {
-      return hydrateParsedRollout(filePath, cached.parsed ?? {});
+    cached = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+    const sameSource = sameRolloutSource(cached, filePath, stat);
+    const unchanged =
+      sameSource &&
+      cached.sourceSize === stat.size &&
+      cached.mtimeMs === Math.trunc(stat.mtimeMs);
+    if (unchanged) {
+      parsed = hydrateParsedRollout(filePath, cached.parsed ?? {});
+      parsed.offset = Number(cached.offset ?? stat.size);
+      return parsed;
+    }
+    const appendOnly =
+      sameSource &&
+      Number.isFinite(cached.sourceSize) &&
+      Number.isFinite(cached.offset) &&
+      cached.sourceSize < stat.size &&
+      cached.offset >= 0 &&
+      cached.offset <= cached.sourceSize;
+    if (appendOnly) {
+      parsed = hydrateParsedRollout(filePath, cached.parsed ?? {});
+      parsed.offset = cached.offset;
     }
   } catch {
     // A missing, stale, or partial cache is rebuilt below.
   }
 
-  const parsed = parseRollout(filePath);
+  if (!parsed) {
+    parsed = emptyParsedRollout(filePath);
+  }
+  const bytes = readRolloutTail(filePath, parsed.offset, stat.size);
+  parsed.offset += appendRolloutBytes(parsed, bytes);
+
   try {
     fs.mkdirSync(cacheDirectory, { recursive: true });
+    const temporaryPath = `${cachePath}.${process.pid}.tmp`;
     fs.writeFileSync(
-      cachePath,
+      temporaryPath,
       JSON.stringify(serializeParsedRollout(parsed, stat)),
-      'utf8',
+      { encoding: 'utf8', mode: 0o600 },
     );
+    fs.renameSync(temporaryPath, cachePath);
   } catch {
     // Cache failures must not block the hook.
   }
@@ -516,6 +639,7 @@ function buildAccounting(parsed, ownedTaskStarts, branchIndex, defaultModel, war
         rootTurnId: null,
         usage: zeroUsage(),
         cost: 0,
+        exact: true,
       },
     ]),
   );
@@ -530,6 +654,11 @@ function buildAccounting(parsed, ownedTaskStarts, branchIndex, defaultModel, war
   for (const event of parsed.tokenEvents) {
     if (event.index > branchIndex) {
       markers.push({ type: 'token', index: event.index, event });
+    }
+  }
+  for (const event of parsed.invalidTokenEvents) {
+    if (event.index > branchIndex) {
+      markers.push({ type: 'invalid-token', index: event.index, event });
     }
   }
   markers.sort((left, right) => left.index - right.index);
@@ -553,6 +682,18 @@ function buildAccounting(parsed, ownedTaskStarts, branchIndex, defaultModel, war
       continue;
     }
 
+    if (marker.type === 'invalid-token') {
+      const task = activeTaskId ? tasks.get(activeTaskId) : null;
+      if (task) {
+        task.exact = false;
+      }
+      warnings.push(
+        `Malformed token counter in ${path.basename(parsed.filePath)}.`,
+      );
+      exact = false;
+      continue;
+    }
+
     const event = marker.event;
     if (sameUsage(previous, event.total)) {
       continue;
@@ -564,6 +705,12 @@ function buildAccounting(parsed, ownedTaskStarts, branchIndex, defaultModel, war
     } else {
       delta = hasUsage(event.last) ? event.last : event.total;
       warnings.push(`Token counter reset in ${path.basename(parsed.filePath)}.`);
+      if (activeTaskId) {
+        const task = tasks.get(activeTaskId);
+        if (task) {
+          task.exact = false;
+        }
+      }
       exact = false;
     }
     previous = event.total;
@@ -586,6 +733,16 @@ function buildAccounting(parsed, ownedTaskStarts, branchIndex, defaultModel, war
       task.usage = addUsage(task.usage, delta);
     } else {
       warnings.push(`Unassigned token usage in ${path.basename(parsed.filePath)}.`);
+      exact = false;
+    }
+  }
+
+  for (const task of tasks.values()) {
+    if (!hasUsage(task.usage)) {
+      task.exact = false;
+      warnings.push(
+        `Task completed without a usable token counter in ${path.basename(parsed.filePath)}.`,
+      );
       exact = false;
     }
   }
@@ -668,6 +825,7 @@ function mapChildTasksToRoot(parentAccounting, childAccounting, childThreadId, w
 
     if (!best || best.distance > 10_000) {
       warnings.push(`Could not map subagent task ${task.id} to its parent turn.`);
+      task.exact = false;
       exact = false;
       continue;
     }
@@ -676,6 +834,7 @@ function mapChildTasksToRoot(parentAccounting, childAccounting, childThreadId, w
     const parentTask = findActiveTask(parentAccounting, best.activity.index);
     if (!parentTask?.rootTurnId) {
       warnings.push(`Could not resolve the root turn for subagent task ${task.id}.`);
+      task.exact = false;
       exact = false;
       continue;
     }
@@ -700,6 +859,7 @@ function mapChildTasksToRoot(parentAccounting, childAccounting, childThreadId, w
       warnings.push(
         'At least one subagent task was still open; its values are cost-so-far.',
       );
+      task.exact = false;
       exact = false;
     }
   }
@@ -749,6 +909,50 @@ function priceSegments(segments) {
   };
 }
 
+function summarizeSegments(segments) {
+  const usage = usageForSegments(segments);
+  const pricing = priceSegments(segments);
+  return {
+    usage,
+    cost: pricing.cost,
+    costEur: eurosFromUsd(pricing.cost),
+  };
+}
+
+function turnBreakdown(segments, subagentThreadCount) {
+  const byModel = new Map();
+  const byRole = {
+    root: [],
+    subagents: [],
+  };
+
+  for (const segment of segments) {
+    const model = normalizeModel(segment.model) ?? 'unknown';
+    const modelSegments = byModel.get(model) ?? [];
+    modelSegments.push(segment);
+    byModel.set(model, modelSegments);
+    byRole[segment.agentRole === 'subagent' ? 'subagents' : 'root'].push(
+      segment,
+    );
+  }
+
+  return {
+    modelBreakdown: [...byModel.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([model, modelSegments]) => ({
+        model,
+        ...summarizeSegments(modelSegments),
+      })),
+    agentBreakdown: {
+      root: summarizeSegments(byRole.root),
+      subagents: {
+        ...summarizeSegments(byRole.subagents),
+        threadCount: subagentThreadCount,
+      },
+    },
+  };
+}
+
 function formatTokens(value) {
   return new Intl.NumberFormat('en-US').format(Math.round(value));
 }
@@ -794,7 +998,15 @@ function noBreak(value) {
   return String(value).replaceAll(' ', '\u00a0');
 }
 
-function usageNowMs(fallbackMs) {
+function hookNowMs() {
+  const override = Date.parse(process.env.CODEX_TURN_COST_NOW ?? '');
+  if (Number.isFinite(override)) {
+    return override;
+  }
+  return Date.now();
+}
+
+function completionMs(fallbackMs) {
   const override = Date.parse(process.env.CODEX_TURN_COST_NOW ?? '');
   if (Number.isFinite(override)) {
     return override;
@@ -802,164 +1014,201 @@ function usageNowMs(fallbackMs) {
   return Number.isFinite(fallbackMs) ? fallbackMs : Date.now();
 }
 
-function usageTimeZone() {
-  const configured = process.env.CODEX_TURN_COST_TIME_ZONE;
-  if (configured) {
-    try {
-      new Intl.DateTimeFormat('en-US', { timeZone: configured }).format();
-      return configured;
-    } catch {
-      // Fall through to the operating system timezone.
-    }
-  }
-  return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+function monthLabel(timestampMs, timeZone) {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    month: 'short',
+  }).format(new Date(timestampMs));
 }
 
-function usagePeriod(timestampMs, timeZone) {
-  const parts = Object.fromEntries(
-    new Intl.DateTimeFormat('en-US', {
-      timeZone,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    })
-      .formatToParts(new Date(timestampMs))
-      .filter((part) => part.type !== 'literal')
-      .map((part) => [part.type, part.value]),
-  );
-  const localDate = `${parts.year}-${parts.month}-${parts.day}`;
-  return {
-    localDate,
-    month: `${parts.year}-${parts.month}`,
-    monthLabel: new Intl.DateTimeFormat('en-US', {
-      timeZone,
-      month: 'short',
-    }).format(new Date(timestampMs)),
-  };
-}
-
-function pluginDataRoot(codexHome) {
-  const configured = process.env.PLUGIN_DATA?.trim();
-  return configured ? path.resolve(configured) : codexHome;
-}
-
-function safeLedgerName(value) {
-  return String(value).replace(/[^A-Za-z0-9_-]/g, '_');
-}
-
-function readLedgerRecords(filePath) {
-  let content;
-  try {
-    content = fs.readFileSync(filePath, 'utf8');
-  } catch {
-    return [];
-  }
-
-  const records = [];
-  for (const line of content.split(/\r?\n/)) {
-    if (!line.trim()) {
-      continue;
-    }
-    try {
-      const record = JSON.parse(line);
-      if (
-        record?.schema === LEDGER_SCHEMA &&
-        record.root_thread_id &&
-        record.turn_id &&
-        Number.isFinite(record.cost_eur_nanos)
-      ) {
-        records.push(record);
-      }
-    } catch {
-      // Ignore an invalid line without losing the other recorded turns.
-    }
-  }
-  return records;
-}
-
-function aggregateLedgerMonth(monthDirectory, localDate) {
-  const recordsByTurn = new Map();
-  let entries = [];
-  try {
-    entries = fs.readdirSync(monthDirectory, { withFileTypes: true });
-  } catch {
-    return { todayCostEur: 0, monthCostEur: 0 };
-  }
-
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith('.jsonl')) {
-      continue;
-    }
-    for (const record of readLedgerRecords(path.join(monthDirectory, entry.name))) {
-      const key = `${record.root_thread_id}\u0000${record.turn_id}`;
-      recordsByTurn.set(key, record);
-    }
-  }
-
-  let todayNanos = 0;
-  let monthNanos = 0;
-  for (const record of recordsByTurn.values()) {
-    monthNanos += record.cost_eur_nanos;
-    if (record.local_date === localDate) {
-      todayNanos += record.cost_eur_nanos;
-    }
-  }
-  return {
-    todayCostEur: nanosToEuros(todayNanos),
-    monthCostEur: nanosToEuros(monthNanos),
-  };
-}
-
-function updateUsageLedger(result) {
+function ledgerRecordFor(result, completedAtMs, writtenAtMs) {
   const context = result.ledgerContext;
-  const nowMs = usageNowMs(context.completedAtMs);
-  const timeZone = usageTimeZone();
-  const period = usagePeriod(nowMs, timeZone);
-  const monthDirectory = path.join(
-    context.dataRoot,
-    'usage',
-    period.month,
-  );
-  const ledgerPath = path.join(
-    monthDirectory,
-    `${safeLedgerName(context.rootThreadId)}.jsonl`,
-  );
-  fs.mkdirSync(monthDirectory, { recursive: true });
-
-  const record = {
-    schema: LEDGER_SCHEMA,
+  return {
+    schema: 2,
     root_thread_id: context.rootThreadId,
     session_id: context.rootSessionId,
     turn_id: context.turnId,
-    recorded_at: new Date(nowMs).toISOString(),
-    local_date: period.localDate,
-    timezone: timeZone,
-    model: result.model,
+    completed_at: new Date(completedAtMs).toISOString(),
+    written_at: new Date(writtenAtMs).toISOString(),
     usage: result.turn.usage,
-    agent_threads: result.turnAgentThreads,
     pricing_as_of: result.pricingAsOf,
     cost_usd_nanos: Math.round(result.turn.cost * 1_000_000_000),
     eur_per_usd: EUR_PER_USD,
     cost_eur_nanos: eurosToNanos(eurosFromUsd(result.turn.cost)),
+    model_breakdown: result.turn.modelBreakdown.map((part) => ({
+      model: part.model,
+      usage: part.usage,
+      cost_usd_nanos: Math.round(part.cost * 1_000_000_000),
+      cost_eur_nanos: eurosToNanos(part.costEur),
+    })),
+    agent_breakdown: {
+      root: {
+        usage: result.turn.agentBreakdown.root.usage,
+        cost_usd_nanos: Math.round(
+          result.turn.agentBreakdown.root.cost * 1_000_000_000,
+        ),
+        cost_eur_nanos: eurosToNanos(
+          result.turn.agentBreakdown.root.costEur,
+        ),
+      },
+      subagents: {
+        usage: result.turn.agentBreakdown.subagents.usage,
+        cost_usd_nanos: Math.round(
+          result.turn.agentBreakdown.subagents.cost * 1_000_000_000,
+        ),
+        cost_eur_nanos: eurosToNanos(
+          result.turn.agentBreakdown.subagents.costEur,
+        ),
+        thread_count: result.turn.agentBreakdown.subagents.threadCount,
+      },
+    },
   };
+}
 
-  const exists = readLedgerRecords(ledgerPath).some(
-    (candidate) =>
-      candidate.root_thread_id === record.root_thread_id &&
-      candidate.turn_id === record.turn_id,
+function ledgerGapFor(result, reason, completedAtMs, writtenAtMs) {
+  const context = result.ledgerContext;
+  return {
+    schema: 2,
+    entry_type: 'gap',
+    root_thread_id: context.rootThreadId,
+    turn_id: context.turnId,
+    completed_at: new Date(completedAtMs).toISOString(),
+    written_at: new Date(writtenAtMs).toISOString(),
+    reason,
+  };
+}
+
+function budgetThresholdCrossings(before, after, settings) {
+  const thresholds = settings.budgets.warning_thresholds_percent;
+  return {
+    daily: crossedBudgetThresholds(
+      before?.budgets?.daily,
+      after?.budgets?.daily,
+      thresholds,
+    ),
+    monthly: crossedBudgetThresholds(
+      before?.budgets?.monthly,
+      after?.budgets?.monthly,
+      thresholds,
+    ),
+  };
+}
+
+function recordUsageGap(result, reason) {
+  const context = result.ledgerContext;
+  const nowMs = hookNowMs();
+  const completedAtMs = completionMs(context.completedAtMs);
+  const appendResult = appendLedgerGap(
+    context.dataRoot,
+    ledgerGapFor(result, reason, completedAtMs, nowMs),
+    { now: nowMs },
   );
-  if (!exists) {
-    fs.appendFileSync(ledgerPath, `${JSON.stringify(record)}\n`, 'utf8');
+  result.warnings.push(...appendResult.diagnostics);
+  if (appendResult.conflict) {
+    throw new Error('A conflicting accounting gap already exists for this turn.');
+  }
+  return appendResult;
+}
+
+function fatalLedgerContext(hookInput) {
+  const transcriptPath = resolveTranscriptPath(hookInput.transcript_path);
+  if (!transcriptPath || !fs.existsSync(transcriptPath)) {
+    return null;
+  }
+  const sessionsRoot = findSessionsRoot(transcriptPath);
+  if (!sessionsRoot) {
+    return null;
+  }
+  const metadata = readSessionMetadata(transcriptPath);
+  if (!metadata || metadata.isSubagent || !metadata.threadId) {
+    return null;
+  }
+  if (
+    typeof hookInput.turn_id !== 'string' ||
+    hookInput.turn_id.length === 0
+  ) {
+    return null;
+  }
+  return {
+    dataRoot: resolveDataRoot({
+      pluginData: process.env.PLUGIN_DATA,
+      codexHome: path.dirname(sessionsRoot),
+    }),
+    rootThreadId: metadata.threadId,
+    turnId: hookInput.turn_id,
+  };
+}
+
+function recordFatalUsageGap(hookInput) {
+  const context = fatalLedgerContext(hookInput);
+  if (!context) {
+    return null;
+  }
+  const nowMs = hookNowMs();
+  return appendLedgerGap(
+    context.dataRoot,
+    {
+      schema: 2,
+      entry_type: 'gap',
+      root_thread_id: context.rootThreadId,
+      turn_id: context.turnId,
+      completed_at: new Date(nowMs).toISOString(),
+      written_at: new Date(nowMs).toISOString(),
+      reason: 'accounting_error',
+    },
+    { now: nowMs },
+  );
+}
+
+function updateUsageLedger(result) {
+  const context = result.ledgerContext;
+  const nowMs = hookNowMs();
+  const completedAtMs = completionMs(context.completedAtMs);
+  const loadedSettings = loadSettings(context.dataRoot);
+  result.warnings.push(...loadedSettings.diagnostics);
+  const settings = loadedSettings.settings;
+  const beforeSnapshot = settings.notifications.windows
+    ? buildSnapshot(context.dataRoot, {
+        settings,
+        now: nowMs,
+      })
+    : null;
+  const before = beforeSnapshot?.complete === true ? beforeSnapshot : null;
+  const appendResult = appendLedgerRecord(
+    context.dataRoot,
+    ledgerRecordFor(result, completedAtMs, nowMs),
+    { now: nowMs },
+  );
+  result.warnings.push(...appendResult.diagnostics);
+  if (appendResult.conflict) {
+    throw new Error('A conflicting record already exists for this turn.');
+  }
+  const snapshot = buildSnapshot(context.dataRoot, {
+    settings,
+    now: nowMs,
+  });
+  result.warnings.push(...snapshot.diagnostics);
+  if (!snapshot.complete) {
+    throw new Error(
+      'The usage ledger could not be read completely; aggregate totals were suppressed.',
+    );
   }
 
   return {
-    ...aggregateLedgerMonth(monthDirectory, period.localDate),
-    localDate: period.localDate,
-    month: period.month,
-    monthLabel: period.monthLabel,
-    timeZone,
-    ledgerPath,
-    recorded: !exists,
+    todayCostEur: nanosToEuros(snapshot.today.cost_eur_nanos),
+    monthCostEur: nanosToEuros(snapshot.month.cost_eur_nanos),
+    localDate: snapshot.today.date,
+    month: snapshot.month.month,
+    monthLabel: monthLabel(nowMs, snapshot.timezone),
+    timeZone: snapshot.timezone,
+    ledgerPath: appendResult.ledgerPath,
+    recorded: appendResult.recorded,
+    settings,
+    snapshot,
+    thresholdCrossings:
+      before && appendResult.recorded
+        ? budgetThresholdCrossings(before, snapshot, settings)
+        : { daily: [], monthly: [] },
   };
 }
 
@@ -989,7 +1238,10 @@ function analyze(hookInput) {
     throw new Error('The Codex sessions directory could not be located.');
   }
   const codexHome = path.dirname(sessionsRoot);
-  const dataRoot = pluginDataRoot(codexHome);
+  const dataRoot = resolveDataRoot({
+    pluginData: process.env.PLUGIN_DATA,
+    codexHome,
+  });
   const cacheDirectory = path.join(
     dataRoot,
     'hook-cache',
@@ -1043,10 +1295,15 @@ function analyze(hookInput) {
     task.rootTurnId = task.id;
   }
 
-  const sessionFileIndex = buildSessionFileIndex(sessionsRoot);
+  const sessionFileIndex = buildSessionFileIndex(
+    sessionsRoot,
+    cacheDirectory,
+  );
   const accountingByThread = new Map([[rootThreadId, rootAccounting]]);
   const pending = [rootThreadId];
   const visited = new Set([rootThreadId]);
+  const currentTurnId = hookInput.turn_id;
+  let currentTraversalComplete = true;
 
   while (pending.length > 0) {
     const parentThreadId = pending.shift();
@@ -1062,11 +1319,16 @@ function analyze(hookInput) {
     );
 
     for (const spawnActivity of spawnActivities) {
+      const spawnedForRootTurnId = findActiveTask(
+        parentAccounting,
+        spawnActivity.index,
+      )?.rootTurnId;
       if (performance.now() - analysisStarted > ANALYSIS_BUDGET_MS) {
         warnings.push(
           'The analysis time budget was reached before every subagent could be included.',
         );
         complete = false;
+        currentTraversalComplete = false;
         warming = true;
         pending.length = 0;
         break;
@@ -1086,6 +1348,9 @@ function analyze(hookInput) {
       if (!childMetadata) {
         warnings.push(`Missing or mismatched rollout for subagent ${childThreadId}.`);
         complete = false;
+        if (spawnedForRootTurnId === currentTurnId) {
+          currentTraversalComplete = false;
+        }
         continue;
       }
 
@@ -1106,6 +1371,7 @@ function analyze(hookInput) {
           'The analysis time budget was reached before every subagent could be included.',
         );
         complete = false;
+        currentTraversalComplete = false;
         warming = true;
         pending.length = 0;
         break;
@@ -1118,6 +1384,9 @@ function analyze(hookInput) {
       if (!branchTask) {
         warnings.push(`Could not find the branch point for subagent ${childThreadId}.`);
         complete = false;
+        if (spawnedForRootTurnId === currentTurnId) {
+          currentTraversalComplete = false;
+        }
         continue;
       }
 
@@ -1139,6 +1408,15 @@ function analyze(hookInput) {
         warnings,
       );
       complete = complete && childMappingExact;
+      if (
+        !childMappingExact &&
+        (spawnedForRootTurnId === currentTurnId ||
+          [...childAccounting.tasks.values()].some(
+            (task) => task.rootTurnId === currentTurnId,
+          ))
+      ) {
+        currentTraversalComplete = false;
+      }
 
       accountingByThread.set(childThreadId, childAccounting);
       visited.add(childThreadId);
@@ -1148,19 +1426,42 @@ function analyze(hookInput) {
 
   const sessionSegments = [];
   const turnSegments = [];
-  const currentTurnId = hookInput.turn_id;
   const currentRootTask = rootAccounting.tasks.get(currentTurnId);
   const turnAgentThreadIds = new Set();
 
   for (const [threadId, accounting] of accountingByThread.entries()) {
     for (const segment of accounting.segments) {
-      sessionSegments.push(segment);
+      const scopedSegment = {
+        ...segment,
+        agentRole: threadId === rootThreadId ? 'root' : 'subagent',
+      };
+      sessionSegments.push(scopedSegment);
       const task = segment.taskId ? accounting.tasks.get(segment.taskId) : null;
       if (task?.rootTurnId === currentTurnId) {
-        turnSegments.push(segment);
+        turnSegments.push(scopedSegment);
         if (threadId !== rootThreadId) {
           turnAgentThreadIds.add(threadId);
         }
+      }
+    }
+  }
+
+  let turnComplete =
+    currentTraversalComplete &&
+    Boolean(
+      currentRootTask &&
+        currentRootTask.completed &&
+        currentRootTask.exact,
+    );
+  if (!currentRootTask) {
+    warnings.push('The current root task could not be found in its rollout.');
+  } else if (!currentRootTask.completed) {
+    warnings.push('The current root task was still open.');
+  }
+  for (const accounting of accountingByThread.values()) {
+    for (const task of accounting.tasks.values()) {
+      if (task.rootTurnId === currentTurnId && !task.exact) {
+        turnComplete = false;
       }
     }
   }
@@ -1169,10 +1470,13 @@ function analyze(hookInput) {
   const sessionUsage = usageForSegments(sessionSegments);
   const turnPricing = priceSegments(turnSegments);
   const sessionPricing = priceSegments(sessionSegments);
+  const breakdown = turnBreakdown(turnSegments, turnAgentThreadIds.size);
   const unpricedModels = new Set([
     ...turnPricing.unpricedModels,
     ...sessionPricing.unpricedModels,
   ]);
+  const turnPriced = turnPricing.unpricedModels.size === 0;
+  const sessionPriced = sessionPricing.unpricedModels.size === 0;
 
   if (unpricedModels.size > 0) {
     warnings.push(`No hardcoded price for: ${[...unpricedModels].join(', ')}.`);
@@ -1184,13 +1488,18 @@ function analyze(hookInput) {
     model: modelLabel(sessionPricing.models, hookInput.model),
     agentThreads: Math.max(0, accountingByThread.size - 1),
     turnAgentThreads: turnAgentThreadIds.size,
-    complete,
+    complete: turnComplete,
+    turnComplete,
+    sessionComplete: complete,
     warming,
-    priced: unpricedModels.size === 0,
+    priced: turnPriced && sessionPriced,
+    turnPriced,
+    sessionPriced,
     turn: {
       usage: turnUsage,
       cost: turnPricing.cost,
       costEur: eurosFromUsd(turnPricing.cost),
+      ...breakdown,
     },
     session: {
       usage: sessionUsage,
@@ -1212,21 +1521,25 @@ function analyze(hookInput) {
 }
 
 function buildSystemMessage(result) {
-  if (!result.complete) {
+  const turnComplete = result.turnComplete ?? result.complete;
+  const sessionComplete = result.sessionComplete ?? result.complete;
+  if (!turnComplete) {
     return result.warming
-      ? 'Usage: warming agent-history cache — exact totals will appear on a later turn.'
+      ? 'Usage unavailable — agent-history cache is warming; affected aggregates remain unavailable.'
       : 'Usage unavailable — see hook diagnostics.';
   }
 
-  const turnCost = result.priced
+  const turnCost = result.turnPriced ?? result.priced
     ? formatEuroCost(result.turn.costEur)
     : 'cost unavailable';
-  const sessionCost = result.priced
+  const sessionCost = result.sessionPriced ?? result.priced
     ? formatEuroCost(result.session.costEur)
     : 'cost unavailable';
   const primaryGroups = [
     `Turn + agents ${formatCompactTokens(result.turn.usage.total_tokens)} tok · ${turnCost}`,
-    `Session + agents ${formatCompactTokens(result.session.usage.total_tokens)} tok · ${sessionCost}`,
+    sessionComplete
+      ? `Session + agents ${formatCompactTokens(result.session.usage.total_tokens)} tok · ${sessionCost}`
+      : 'Session + agents unavailable',
   ];
   const secondaryGroups = [];
 
@@ -1241,11 +1554,146 @@ function buildSystemMessage(result) {
   if (result.warnings.length > 0) {
     secondaryGroups.push('See diagnostics');
   }
-  return (
+  const lines = [
     primaryGroups.map(noBreak).join(' │ ') +
-    '  \n' +
-    secondaryGroups.map(noBreak).join(' │ ')
-  );
+      '  \n' +
+      secondaryGroups.map(noBreak).join(' │ '),
+  ];
+
+  const budgets = result.ledger?.snapshot?.budgets;
+  if (
+    budgets &&
+    (budgets.daily.limit_eur_nanos !== null ||
+      budgets.monthly.limit_eur_nanos !== null)
+  ) {
+    const budgetGroups = [];
+    for (const [label, budget] of [
+      ['Today', budgets.daily],
+      ['Month', budgets.monthly],
+    ]) {
+      if (budget.limit_eur_nanos === null) {
+        continue;
+      }
+      const percentage = Math.round(budget.percentage);
+      const balance =
+        budget.over_eur_nanos > 0
+          ? `${formatEuroCost(nanosToEuros(budget.over_eur_nanos))} over`
+          : `${formatEuroCost(
+              nanosToEuros(budget.remaining_eur_nanos),
+            )} left`;
+      budgetGroups.push(`${label} ${percentage}% · ${balance}`);
+    }
+    budgetGroups.push(
+      `Forecast ${formatEuroCost(
+        nanosToEuros(budgets.forecast_eur_nanos),
+      )}`,
+    );
+    lines.push(`Budget: ${budgetGroups.map(noBreak).join(' │ ')}`);
+  }
+
+  if (result.ledger?.settings?.hook?.message_format === 'detailed') {
+    const root = result.turn.agentBreakdown.root;
+    const subagents = result.turn.agentBreakdown.subagents;
+    const usage = result.turn.usage;
+    const freshInput = Math.max(
+      0,
+      usage.input_tokens -
+        usage.cached_input_tokens -
+        usage.cache_write_input_tokens,
+    );
+    lines.push(
+      [
+        `Breakdown: Root ${formatEuroCost(root.costEur)}`,
+        `Agents ${formatEuroCost(subagents.costEur)}`,
+        `Fresh ${formatCompactTokens(freshInput)} tok`,
+        `Cached ${formatCompactTokens(usage.cached_input_tokens)} tok`,
+      ]
+        .map(noBreak)
+        .join(' │ '),
+    );
+  }
+
+  return lines.join('  \n');
+}
+
+function notificationMessage(ledger) {
+  const crossed = [];
+  if (ledger.thresholdCrossings.daily.length > 0) {
+    crossed.push(
+      `daily ${Math.max(...ledger.thresholdCrossings.daily)}%`,
+    );
+  }
+  if (ledger.thresholdCrossings.monthly.length > 0) {
+    crossed.push(
+      `monthly ${Math.max(...ledger.thresholdCrossings.monthly)}%`,
+    );
+  }
+  if (crossed.length === 0) {
+    return null;
+  }
+  return `Budget threshold reached: ${crossed.join(', ')}.`;
+}
+
+function windowsNotificationCommand(message) {
+  const encodedMessage = Buffer.from(message, 'utf8').toString('base64');
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    'Add-Type -AssemblyName System.Windows.Forms',
+    'Add-Type -AssemblyName System.Drawing',
+    `$message = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("${encodedMessage}"))`,
+    '$icon = [System.Windows.Forms.NotifyIcon]::new()',
+    '$icon.Icon = [System.Drawing.SystemIcons]::Information',
+    '$icon.BalloonTipTitle = "Codex Cost Meter"',
+    '$icon.BalloonTipText = $message',
+    '$icon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info',
+    '$icon.Visible = $true',
+    '$icon.ShowBalloonTip(5000)',
+    'Start-Sleep -Seconds 6',
+    '$icon.Dispose()',
+  ].join('; ');
+  return Buffer.from(script, 'utf16le').toString('base64');
+}
+
+function maybeSendWindowsNotification(ledger) {
+  if (
+    !ledger?.settings?.notifications?.windows ||
+    process.env.CODEX_TURN_COST_DISABLE_NOTIFICATIONS === '1'
+  ) {
+    return null;
+  }
+  const message = notificationMessage(ledger);
+  if (!message) {
+    return null;
+  }
+
+  if (process.platform !== 'win32' && !process.env.WSL_DISTRO_NAME) {
+    return 'Windows budget notification could not be displayed.';
+  }
+  try {
+    const encodedCommand = windowsNotificationCommand(message);
+    const notification = spawn(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-WindowStyle',
+        'Hidden',
+        '-EncodedCommand',
+        encodedCommand,
+      ],
+      {
+        detached: true,
+        env: process.env,
+        stdio: 'ignore',
+        windowsHide: true,
+      },
+    );
+    notification.on('error', () => {});
+    notification.unref();
+  } catch {
+    return 'Windows budget notification could not be displayed.';
+  }
+  return null;
 }
 
 function main() {
@@ -1255,20 +1703,62 @@ function main() {
   }
 
   const hookInput = JSON.parse(rawInput);
-  waitForFileToSettle(resolveTranscriptPath(hookInput.transcript_path));
-  const result = analyze(hookInput);
   const debug = process.argv.includes('--debug-json');
+  let result;
+  try {
+    waitForFileToSettle(resolveTranscriptPath(hookInput.transcript_path));
+    result = analyze(hookInput);
+  } catch (error) {
+    if (!debug) {
+      try {
+        const appendResult = recordFatalUsageGap(hookInput);
+        if (appendResult?.conflict) {
+          process.stderr.write(
+            'turn-cost hook diagnostics:\n- A conflicting accounting gap already exists for this turn.\n',
+          );
+        }
+      } catch (gapError) {
+        const message =
+          gapError instanceof Error ? gapError.message : String(gapError);
+        process.stderr.write(
+          `turn-cost hook diagnostics:\n- Fatal accounting gap could not be recorded: ${message}\n`,
+        );
+      }
+    }
+    throw error;
+  }
 
   if (result.skip) {
     return;
   }
 
-  if (!debug && result.complete && result.priced) {
-    try {
-      result.ledger = updateUsageLedger(result);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      result.warnings.push(`Usage ledger could not be updated: ${message}`);
+  if (!debug) {
+    const turnComplete = result.turnComplete ?? result.complete;
+    if (turnComplete && result.turnPriced) {
+      try {
+        result.ledger = updateUsageLedger(result);
+        const notificationWarning = maybeSendWindowsNotification(result.ledger);
+        if (notificationWarning) {
+          result.warnings.push(notificationWarning);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        result.warnings.push(`Usage ledger could not be updated: ${message}`);
+      }
+    } else {
+      const reason = turnComplete
+        ? 'pricing_unavailable'
+        : hasUsage(result.turn.usage)
+          ? 'history_incomplete'
+          : 'usage_unavailable';
+      try {
+        recordUsageGap(result, reason);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        result.warnings.push(
+          `Usage ledger gap could not be recorded: ${message}`,
+        );
+      }
     }
   }
 
@@ -1291,20 +1781,39 @@ function main() {
   );
 }
 
-try {
-  main();
-} catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  if (process.argv.includes('--debug-json')) {
-    process.stderr.write(`${message}\n`);
-    process.exitCode = 1;
-  } else {
-    process.stdout.write(
-      `${JSON.stringify({
-        continue: true,
-        systemMessage: 'Usage unavailable for this turn.',
-      })}\n`,
-    );
-    process.stderr.write(`turn-cost hook: ${message}\n`);
+if (require.main === module) {
+  try {
+    main();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (process.argv.includes('--debug-json')) {
+      process.stderr.write(`${message}\n`);
+      process.exitCode = 1;
+    } else {
+      process.stdout.write(
+        `${JSON.stringify({
+          continue: true,
+          systemMessage: 'Usage unavailable for this turn.',
+        })}\n`,
+      );
+      process.stderr.write(`turn-cost hook: ${message}\n`);
+    }
   }
 }
+
+module.exports = {
+  analyze,
+  appendRolloutBytes,
+  buildSystemMessage,
+  emptyParsedRollout,
+  ledgerGapFor,
+  ledgerRecordFor,
+  main,
+  parseRollout,
+  parseRolloutCached,
+  recordFatalUsageGap,
+  recordUsageGap,
+  turnBreakdown,
+  updateUsageLedger,
+  windowsNotificationCommand,
+};
