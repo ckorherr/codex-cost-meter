@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Cost Meter"
-  short_description: "Explain and configure local Codex cost totals"
-  default_prompt: "Use $codex-cost-meter to explain or configure my local Codex usage totals."
+  short_description: "Show and configure local Codex cost insights"
+  default_prompt: "Use $codex-cost-meter to show my private cost dashboard or explain its local totals and settings."

@@ -1,7 +1,7 @@
 {
   "name": "codex-cost-meter",
-  "version": "0.1.0",
-  "description": "Display local Codex token usage and estimated EUR costs after every root turn.",
+  "version": "0.2.0",
+  "description": "Display local Codex usage, estimated EUR costs, budgets, and dashboards.",
   "author": {
     "name": "Codex Cost Meter contributors"
   },
@@ -18,14 +18,16 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex Cost Meter",
-    "shortDescription": "Local token and estimated cost totals",
-    "longDescription": "Shows per-turn, session, daily, and monthly token usage and estimated EUR cost, including transitive subagents and fork-aware accounting.",
+    "shortDescription": "Local usage, budgets, and cost dashboards",
+    "longDescription": "Shows fork-aware token and estimated EUR cost totals, configurable budget guidance, and private local or in-chat dashboards.",
     "developerName": "Codex Cost Meter contributors",
     "category": "Developer Tools",
     "capabilities": [
       "Usage insights",
-      "Local-only accounting"
+      "Budget guidance",
+      "Local-only accounting",
+      "Private dashboards"
     ],
-    "defaultPrompt": "Explain the Codex Cost Meter totals and configuration."
+    "defaultPrompt": "Show my Codex cost dashboard or explain its local usage totals and settings."
   }
 }
