@@ -19,6 +19,7 @@ const rendererPath = path.resolve(
 const {
   MAX_FRAGMENT_BYTES,
   renderDashboardFragment,
+  visualizationReferencePath,
 } = require(rendererPath);
 
 function temporaryDirectory(t, prefix = 'cost-fragment-') {
@@ -137,6 +138,27 @@ test('requires an explicit absolute --output path', () => {
   assert.notEqual(relative.status, 0);
   assert.equal(relative.stdout, '');
   assert.match(relative.stderr, /absolute path/);
+});
+
+test('prints a Windows host path for WSL-mounted visualization files', () => {
+  const mountedPath =
+    '/mnt/c/Users/example/.codex/visualizations/2026/08/20/thread/dashboard.html';
+  assert.equal(
+    visualizationReferencePath(mountedPath, {
+      WSL_DISTRO_NAME: 'Ubuntu-24.04',
+    }),
+    'C:/Users/example/.codex/visualizations/2026/08/20/thread/dashboard.html',
+  );
+  assert.equal(
+    visualizationReferencePath(mountedPath, {}),
+    path.resolve(mountedPath),
+  );
+  assert.equal(
+    visualizationReferencePath('/home/example/dashboard.html', {
+      WSL_DISTRO_NAME: 'Ubuntu-24.04',
+    }),
+    path.resolve('/home/example/dashboard.html'),
+  );
 });
 
 test('writes a self-contained safe fragment with all requested snapshot views', (t) => {
@@ -269,7 +291,10 @@ test('CLI prints only the output path and never snapshot values', (t) => {
   );
 
   assert.equal(invocation.status, 0, invocation.stderr);
-  assert.equal(invocation.stdout, `${outputPath}\n`);
+  assert.equal(
+    invocation.stdout,
+    `${visualizationReferencePath(outputPath)}\n`,
+  );
   assert.equal(invocation.stderr, '');
   assert.doesNotMatch(invocation.stdout, /ledger-secret|€|tokens|turn/i);
   assert.match(fs.readFileSync(outputPath, 'utf8'), /ledger-secret-model-value/);
