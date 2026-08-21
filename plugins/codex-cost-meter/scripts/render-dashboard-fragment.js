@@ -261,6 +261,13 @@ function agentRows(byAgent, runtimeData) {
     ['Root agent', byAgent?.root],
     ['Subagents', byAgent?.subagent],
   ];
+  if (
+    safeNumber(byAgent?.unattributed?.turns) > 0 ||
+    safeNumber(byAgent?.unattributed?.cost_eur_nanos) > 0 ||
+    safeNumber(byAgent?.unattributed?.usage?.total_tokens) > 0
+  ) {
+    groups.push(['Pending attribution', byAgent.unattributed]);
+  }
   return groups
     .map(([label, group]) => `
               <tr>
@@ -339,21 +346,37 @@ function renderFragment(snapshot, runtimeData, options = {}) {
   const refreshMarkup =
     '<button class="btn btn-ghost" type="button" data-ccm-refresh>Refresh</button>';
 
-  if (snapshot.complete === false) {
+  const lowerBound =
+    snapshot.complete === false &&
+    snapshot.lower_bound?.available === true;
+  if (snapshot.complete === false && !lowerBound) {
     return unavailableFragment(rootId, refreshMarkup);
   }
 
-  const todayCost = formatEuroNanos(snapshot.today?.cost_eur_nanos, runtimeData);
-  const monthCost = formatEuroNanos(snapshot.month?.cost_eur_nanos, runtimeData);
-  const forecastCost = formatEuroNanos(
+  const costPrefix = lowerBound ? '≥' : '';
+  const todayCost = `${costPrefix}${formatEuroNanos(snapshot.today?.cost_eur_nanos, runtimeData)}`;
+  const monthCost = `${costPrefix}${formatEuroNanos(snapshot.month?.cost_eur_nanos, runtimeData)}`;
+  const forecastCost = `${costPrefix}${formatEuroNanos(
     snapshot.budgets?.forecast_eur_nanos,
     runtimeData,
-  );
+  )}`;
   const monthForecastDetail =
-    snapshot.budgets?.forecast_percentage === null ||
+    lowerBound
+      ? 'Minimum recorded-cost projection'
+      : snapshot.budgets?.forecast_percentage === null ||
     snapshot.budgets?.forecast_percentage === undefined
       ? 'Recorded-cost projection'
       : `${formatPercent(snapshot.budgets.forecast_percentage)} of monthly budget`;
+  const pendingTurns = safeNumber(snapshot.lower_bound?.pending_turns);
+  const todayPendingTurns = safeNumber(
+    snapshot.lower_bound?.today_pending_turns,
+  );
+  const monthPendingTurns = safeNumber(
+    snapshot.lower_bound?.month_pending_turns,
+  );
+  const lowerBoundNotice = lowerBound
+    ? `<p class="ccm-lower-bound" role="status">Showing a known minimum. ${escapeHtml(String(pendingTurns))} completed ${pendingTurns === 1 ? 'turn is' : 'turns are'} pending exact reconciliation; known portions are included and marked with ≥.</p>`
+    : '';
   const dailyBudget = budgetMarkup(
     'Daily budget',
     snapshot.budgets?.daily,
@@ -425,6 +448,13 @@ function renderFragment(snapshot, runtimeData, options = {}) {
     }
     #${rootId} .ccm-unrestricted {
       margin: 0;
+    }
+    #${rootId} .ccm-lower-bound {
+      margin: 0;
+      padding: 0.75rem 1rem;
+      border-left: 3px solid var(--viz-series-1);
+      background: var(--muted);
+      color: var(--foreground);
     }
     #${rootId} .ccm-bars {
       display: grid;
@@ -521,18 +551,20 @@ function renderFragment(snapshot, runtimeData, options = {}) {
     ${refreshMarkup}
   </header>
 
+  ${lowerBoundNotice}
+
   <div class="viz-grid ccm-summary" aria-label="Spending summary">
     ${summaryCard(
-      'Today',
+      lowerBound ? 'Today · known minimum' : 'Today',
       todayCost,
-      `${safeNumber(snapshot.today?.turns)} turns · ${formatUsage(snapshot.today?.usage, runtimeData)} tokens`,
+      `${safeNumber(snapshot.today?.turns)} ${lowerBound ? 'known turns' : 'turns'} · ${formatUsage(snapshot.today?.usage, runtimeData)} tokens${lowerBound ? ` · ${todayPendingTurns} pending` : ''}`,
     )}
     ${summaryCard(
-      'Current month',
+      lowerBound ? 'Current month · known minimum' : 'Current month',
       monthCost,
-      `${safeNumber(snapshot.month?.turns)} turns · ${formatUsage(snapshot.month?.usage, runtimeData)} tokens`,
+      `${safeNumber(snapshot.month?.turns)} ${lowerBound ? 'known turns' : 'turns'} · ${formatUsage(snapshot.month?.usage, runtimeData)} tokens${lowerBound ? ` · ${monthPendingTurns} pending` : ''}`,
     )}
-    ${summaryCard('Recorded-cost forecast', forecastCost, monthForecastDetail)}
+    ${summaryCard(lowerBound ? 'Minimum forecast' : 'Recorded-cost forecast', forecastCost, monthForecastDetail)}
   </div>
 
   ${budgetSection}

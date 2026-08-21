@@ -333,3 +333,81 @@ test('suppresses numeric totals when the ledger traversal is incomplete', (t) =>
   assert.match(fragment, /no partial totals are shown/);
   assert.doesNotMatch(fragment, /987|€/);
 });
+
+test('renders trustworthy gap amounts as a pending lower bound', (t) => {
+  const outputPath = path.join(
+    temporaryDirectory(t),
+    'lower-bound-dashboard.html',
+  );
+  const fakeRuntime = {
+    EUR_NANOS: 1_000_000_000,
+    resolveDataRoot() {
+      return '/unused';
+    },
+    loadSettings() {
+      return { settings: runtime.defaultSettings() };
+    },
+    buildSnapshot() {
+      return {
+        complete: false,
+        generated_at: '2026-08-20T13:00:00.000Z',
+        timezone: 'Europe/Berlin',
+        lower_bound: {
+          available: true,
+          pending_turns: 2,
+          known_pending_turns: 1,
+          unknown_pending_turns: 1,
+          today_pending_turns: 1,
+          seven_day_pending_turns: 2,
+          month_pending_turns: 2,
+        },
+        today: {
+          turns: 1,
+          cost_eur_nanos: 1_250_000_000,
+          usage: usage(100, 20, 0, 10),
+        },
+        month: {
+          turns: 2,
+          cost_eur_nanos: 2_500_000_000,
+          usage: usage(200, 40, 0, 20),
+        },
+        seven_days: [],
+        budgets: {
+          daily: { limit_eur_nanos: null },
+          monthly: { limit_eur_nanos: null },
+          forecast_eur_nanos: 3_750_000_000,
+          forecast_percentage: null,
+        },
+        by_model: [],
+        by_session: [],
+        by_agent: {
+          root: {},
+          subagent: {},
+          unattributed: {
+            turns: 1,
+            cost_eur_nanos: 500_000_000,
+            usage: usage(50, 0, 0, 5),
+          },
+        },
+        cache: {},
+        recent_turns: [],
+      };
+    },
+    formatEuroCost: runtime.formatEuroCost,
+    formatTokens: runtime.formatTokens,
+  };
+
+  renderDashboardFragment({
+    outputPath,
+    runtimeData: fakeRuntime,
+    rootId: 'lower-bound-dashboard-test',
+  });
+  const fragment = fs.readFileSync(outputPath, 'utf8');
+
+  assert.match(fragment, /Showing a known minimum/);
+  assert.match(fragment, /2 completed turns are pending/);
+  assert.match(fragment, /≥€1\.25/);
+  assert.match(fragment, /1 pending/);
+  assert.match(fragment, /Pending attribution/);
+  assert.doesNotMatch(fragment, /no partial totals are shown/);
+});

@@ -86,6 +86,10 @@ renderer prints only its output path. The browser view never fetches ledger
 data or sends accounting values; its Refresh button sends only a fixed request
 asking Codex to generate a new snapshot.
 
+This in-chat view is deliberately a point-in-time snapshot. Task labels remain
+local hashes there; friendly task-name lookup and automatic refresh are
+features of the separately started localhost dashboard only.
+
 This is an on-demand Codex visualization, not a permanent native sidebar,
 panel, or Settings page. Use the local dashboard for live refresh and editing
 settings.
@@ -106,20 +110,37 @@ npm run dashboard
 ```
 
 It listens only on `127.0.0.1:43117` and prints the URL and resolved data
-directory. It never starts automatically from the hook.
+directory. It never starts automatically from the hook. While a dashboard page
+is connected, the server watches for relevant local changes and uses periodic
+file-stat checks as a fallback. It rebuilds the full view in the dashboard
+process, keeps the latest successful result in memory, and notifies the page to
+refresh. This work is separate from the Stop hook and does not add task-name
+lookups, full-history reads, or filesystem watching to the hook's time budget.
 
 Optional arguments:
 
 ```sh
 npm run dashboard -- --port 43118
 npm run dashboard -- --data-dir /absolute/path/to/plugin-data
+npm run dashboard -- --codex-home /absolute/path/to/.codex
+npm run dashboard -- --session-index /absolute/path/to/session_index.jsonl
 ```
+
+Use `--codex-home` to select a Codex home or `--session-index` to select the
+exact task-name index. By default, the server looks for `session_index.jsonl`
+under the resolved `CODEX_HOME` (or the Codex home associated with a standard
+plugin-data path). It transiently joins each task's name to the ledger's safe
+hash for display. If the index is missing, malformed, or has no matching entry,
+the dashboard keeps the hashed label. The plugin never writes task names or
+raw task IDs to the accounting ledger or a persistent plugin cache.
 
 When launching from WSL against data stored on Windows, pass the WSL-mounted
 form of the path, for example `/mnt/c/Users/<you>/.codex/...`, rather than a
 `C:\...` path. Check the printed `Data directory` when the page looks empty:
 an ordinary WSL shell with `CODEX_HOME` unset otherwise defaults to the Linux
-home directory.
+home directory. The server also prints its resolved `Task names` path; use
+`--codex-home /mnt/c/Users/<you>/.codex` or an explicit `--session-index` when
+that source lives on the Windows side.
 
 The dashboard shows:
 
@@ -127,7 +148,8 @@ The dashboard shows:
 - daily and monthly budget progress;
 - a seven-day spending chart;
 - recent completed turns;
-- cost by model and safe task identifier;
+- cost by model and task, using a friendly local name when available and a
+  safe hashed identifier as the fallback;
 - root-agent versus subagent usage;
 - cached, uncached, and cache-write input usage.
 
@@ -203,7 +225,11 @@ month rather than one file per session. It never requires a cold scan of Codex
 transcript history. Rebuildable per-rollout caches retain only the current
 accounting metadata needed for appended-byte and bounded-tail reads.
 
-The dashboard reads the compact ledger and never parses Codex transcripts.
+The in-chat dashboard reads the compact ledger and never parses Codex
+transcripts. The localhost dashboard additionally reads the compact
+`session_index.jsonl` task-name index when available; it never scans rollout
+transcripts to find names. Name enrichment is a transient join performed by
+the dashboard server and is not part of accounting or the Stop hook.
 
 Ledger writes update a rebuildable compressed read index and a per-month
 generation marker. In-place edits made outside the plugin must also update that
@@ -213,9 +239,11 @@ automatically. Other JSONL files in a usage-month directory are not accounting
 sources. This general read index supports full dashboard views; it is not on
 the Stop hook's critical path.
 
-All settings, ledgers, locks, and caches remain below `PLUGIN_DATA`. Task labels
-shown in dashboards are local hashes; project paths and task titles are not
-published.
+All settings, ledgers, locks, and caches remain below `PLUGIN_DATA`. The
+in-chat dashboard and persistent accounting data use local task hashes. The
+loopback dashboard may show names from Codex's existing session index, but the
+plugin never persists those names or raw task IDs and falls back to the hash
+when a name cannot be resolved. Project paths are not published.
 
 Version 0.2 introduces ledger schema 2. Development-era schema-1 rows are not
 backfilled; new accounting starts when the updated plugin records its first
@@ -234,6 +262,13 @@ writable plugin data directory. Do not commit that runtime directory.
 The browser dashboard binds only to loopback, rejects untrusted Host and Origin
 headers, uses a per-process CSRF token for settings writes, and loads no
 analytics, CDNs, or external assets.
+
+When available, the localhost dashboard reads task names from Codex's compact
+`session_index.jsonl`. Those names are held only for the running dashboard and
+sent only to its loopback browser page; they are not copied into the ledger,
+plugin caches, or in-chat visualization. The dashboard does not read prompts,
+responses, tool-output text, full project paths, or rollout transcripts for
+name enrichment, and raw task IDs are never exposed to the page.
 
 ## Estimates and configuration
 

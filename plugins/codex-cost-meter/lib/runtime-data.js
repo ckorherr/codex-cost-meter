@@ -3426,10 +3426,14 @@ function groupBySession(records) {
       cost_eur_nanos: 0,
       usage: zeroUsage(),
       turns: 0,
+      last_completed_at: record.completed_at,
     };
     group.cost_eur_nanos += record.cost_eur_nanos;
     group.usage = addUsage(group.usage, record.usage);
     group.turns += 1;
+    if (record.completed_at > group.last_completed_at) {
+      group.last_completed_at = record.completed_at;
+    }
     groups.set(key, group);
   }
   return [...groups.values()].sort(
@@ -3502,6 +3506,7 @@ function recentTurn(record) {
   ];
   return {
     completed_at: record.completed_at,
+    task_key: safeTaskKey(record.root_thread_id),
     task_label: safeTaskLabel(record.root_thread_id),
     turn_label: safeTurnLabel(record.turn_id),
     model:
@@ -3513,6 +3518,26 @@ function recentTurn(record) {
     cost_eur_nanos: record.cost_eur_nanos,
     usage: record.usage,
     agent_threads: record.agent_breakdown.subagents.thread_count,
+  };
+}
+
+function knownGapRecord(gap) {
+  if (
+    !gap?.known_usage ||
+    !Number.isSafeInteger(gap.known_cost_usd_nanos) ||
+    !Number.isSafeInteger(gap.known_cost_eur_nanos)
+  ) {
+    return null;
+  }
+  return {
+    root_thread_id: gap.root_thread_id,
+    turn_id: gap.turn_id,
+    completed_at: gap.completed_at,
+    usage: gap.known_usage,
+    cost_usd_nanos: gap.known_cost_usd_nanos,
+    cost_eur_nanos: gap.known_cost_eur_nanos,
+    model_breakdown: [],
+    lower_bound_gap: true,
   };
 }
 
@@ -3565,16 +3590,30 @@ function buildSnapshot(dataRoot, options = {}) {
       dateSet.has(parts.date)
     );
   });
-  const todayRecords = recordsWithLocalDate
+  const knownGapRecords = relevantGaps
+    .map(knownGapRecord)
+    .filter(Boolean);
+  const accountedRecords = [...completedRecords, ...knownGapRecords].sort(
+    (left, right) =>
+      Date.parse(left.completed_at) - Date.parse(right.completed_at),
+  );
+  const accountedRecordsWithLocalDate = accountedRecords.map((record) => {
+    const parts = localDateParts(record.completed_at, settings.timezone);
+    return { record, localDate: parts.date, localMonth: parts.monthKey };
+  });
+  const todayRecords = accountedRecordsWithLocalDate
     .filter((item) => item.localDate === nowParts.date)
     .map((item) => item.record);
-  const monthRecords = recordsWithLocalDate
+  const monthRecords = accountedRecordsWithLocalDate
     .filter((item) => item.localMonth === nowParts.monthKey)
+    .map((item) => item.record);
+  const sevenDayRecords = accountedRecordsWithLocalDate
+    .filter((item) => dateSet.has(item.localDate))
     .map((item) => item.record);
   const sevenDays = dates.map((date) => ({
     date,
     ...summarizeRecords(
-      recordsWithLocalDate
+      accountedRecordsWithLocalDate
         .filter((item) => item.localDate === date)
         .map((item) => item.record),
     ),
@@ -3601,6 +3640,15 @@ function buildSnapshot(dataRoot, options = {}) {
     settings.timezone,
   );
   const monthlyLimit = monthlyBudget.limit_eur_nanos;
+  const monthTaskGroups = groupBySession(monthRecords);
+  const monthExactRecords = recordsWithLocalDate
+    .filter((item) => item.localMonth === nowParts.monthKey)
+    .map((item) => item.record);
+  const monthKnownGapRecords = monthRecords.filter(
+    (record) => record.lower_bound_gap === true,
+  );
+  const byAgent = groupByAgent(monthExactRecords);
+  byAgent.unattributed = summarizeRecords(monthKnownGapRecords);
   const recentLimit = Math.max(
     0,
     Math.min(
@@ -3614,6 +3662,28 @@ function buildSnapshot(dataRoot, options = {}) {
     generated_at: new Date(nowMs).toISOString(),
     timezone: settings.timezone,
     complete: ledger.complete && relevantGaps.length === 0,
+    lower_bound: {
+      available: ledger.complete && relevantGaps.length > 0,
+      pending_turns: relevantGaps.length,
+      known_pending_turns: knownGapRecords.length,
+      unknown_pending_turns:
+        relevantGaps.length - knownGapRecords.length,
+      today_pending_turns: relevantGaps.filter(
+        (gap) =>
+          localDateParts(gap.completed_at, settings.timezone).date ===
+          nowParts.date,
+      ).length,
+      seven_day_pending_turns: relevantGaps.filter((gap) =>
+        dateSet.has(
+          localDateParts(gap.completed_at, settings.timezone).date,
+        ),
+      ).length,
+      month_pending_turns: relevantGaps.filter(
+        (gap) =>
+          localDateParts(gap.completed_at, settings.timezone).monthKey ===
+          nowParts.monthKey,
+      ).length,
+    },
     today,
     month,
     seven_days: sevenDays,
@@ -3629,8 +3699,13 @@ function buildSnapshot(dataRoot, options = {}) {
           : (forecastEurNanos / monthlyLimit) * 100,
     },
     by_model: groupByModel(monthRecords),
-    by_session: groupBySession(monthRecords),
-    by_agent: groupByAgent(monthRecords),
+    by_session: monthTaskGroups,
+    task_scopes: {
+      today: groupBySession(todayRecords),
+      seven_days: groupBySession(sevenDayRecords),
+      month: monthTaskGroups,
+    },
+    by_agent: byAgent,
     cache: cacheSummary(monthRecords),
     recent_turns: completedRecords
       .slice()

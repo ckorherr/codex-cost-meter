@@ -18,6 +18,24 @@ function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
 }
 
+function localRequireGraph(entryPath, seen = new Set()) {
+  const resolved = path.resolve(entryPath);
+  if (seen.has(resolved)) {
+    return seen;
+  }
+  seen.add(resolved);
+  const source = fs.readFileSync(resolved, 'utf8');
+  const requirePattern = /require\(\s*['"](\.[^'"]+)['"]\s*\)/g;
+  for (const match of source.matchAll(requirePattern)) {
+    const candidate = path.resolve(path.dirname(resolved), match[1]);
+    const dependency = path.extname(candidate) ? candidate : `${candidate}.js`;
+    if (fs.existsSync(dependency)) {
+      localRequireGraph(dependency, seen);
+    }
+  }
+  return seen;
+}
+
 test('marketplace points to a valid portable plugin', () => {
   const marketplace = readJson(
     path.join(repositoryRoot, '.agents', 'plugins', 'marketplace.json'),
@@ -112,4 +130,13 @@ test('bundled hook command resolves the plugin root without emitting for subagen
 
   assert.equal(invocation.status, 0, invocation.stderr);
   assert.equal(invocation.stdout, '');
+});
+
+test('dashboard enrichment stays outside the Stop-hook dependency graph', () => {
+  const graph = localRequireGraph(
+    path.join(pluginRoot, 'scripts', 'turn-cost.js'),
+  );
+  const basenames = new Set([...graph].map((filePath) => path.basename(filePath)));
+  assert.equal(basenames.has('dashboard-task-names.js'), false);
+  assert.equal(basenames.has('dashboard-live.js'), false);
 });

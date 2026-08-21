@@ -31,11 +31,19 @@ node /absolute/plugin/root/scripts/render-dashboard-fragment.js \
 
 The in-chat dashboard is a point-in-time snapshot. Its Refresh button asks
 Codex to generate a new snapshot. It never fetches data from the browser and it
-does not provide settings controls.
+does not provide settings controls. Its task labels remain safe local hashes;
+do not add task names or raw task IDs to the generated snapshot.
 
 For a continuously refreshable dashboard with settings, start the local server
 from the source checkout with `npm run dashboard`. It binds only to
-`127.0.0.1` and prints the local URL. Never start it from the Stop hook.
+`127.0.0.1` and prints the local URL. While a page is connected, the server
+uses filesystem notifications plus periodic stat checks, rebuilds outside the
+hook, caches the latest successful view, and notifies the page of changes. It
+may transiently join friendly task names from Codex's compact
+`session_index.jsonl`; use `--codex-home PATH` or `--session-index PATH` to
+select that source when automatic resolution is unsuitable. Missing or
+unmatched names must fall back to the existing safe hash. Never start the
+server from the Stop hook.
 
 ## Explain
 
@@ -59,9 +67,11 @@ files are ignored.
 At Stop, it reads only the current root turn and the subagents associated with
 that turn. Session, day, and month totals come from a compact, rebuildable
 ledger rollup rather than historical transcript traversal. Rebuildable caches
-contain only accounting metadata. The Stop hook and localhost dashboard make
-no external requests. The in-chat Refresh button sends only a fixed
-user-triggered Codex prompt and never sends ledger values.
+contain only accounting metadata. The localhost dashboard may separately read
+the compact session index for task names, but it never scans rollout
+transcripts for them and never persists names or raw task IDs. The Stop hook
+and localhost dashboard make no external requests. The in-chat Refresh button
+sends only a fixed user-triggered Codex prompt and never sends ledger values.
 
 ## Configure
 
@@ -107,11 +117,18 @@ Preserve these invariants:
   or priced exactly, preserving trustworthy known usage when available;
 - keep the Stop hot path independent of full transcript-history and full-ledger
   scans, including when every derived cache is absent;
+- keep localhost task-name resolution, full-view rebuilding, filesystem
+  watching, polling, and browser live refresh outside the Stop hook and its
+  import dependency graph;
 - never backfill turns that completed before the plugin began recording;
 - keep all settings, ledgers, and caches under `PLUGIN_DATA`;
 - never put prompts, responses, tool output, or full project paths in the
   ledger or dashboard;
-- never send dashboard or accounting data over the network.
+- keep in-chat task labels hashed; the localhost dashboard may transiently
+  display session-index names, but must never persist them or expose raw task
+  IDs, and must use hashed labels as its fallback;
+- never send dashboard or accounting data to external networks; the local
+  server must remain loopback-only.
 
 After changes, run `npm run check`.
 

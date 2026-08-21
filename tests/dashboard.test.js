@@ -6,6 +6,7 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+const vm = require('node:vm');
 
 const dashboardPath = path.resolve(
   __dirname,
@@ -125,8 +126,41 @@ function snapshot(settings) {
         cost_eur_nanos: 8_500_000_000,
         usage: usage(800),
         turns: 8,
+        last_completed_at: '2026-08-20T11:30:00.000Z',
       },
     ],
+    task_scopes: {
+      today: [
+        {
+          label: 'Task <img src=x onerror=alert(1)>',
+          key: 'safe-local-key',
+          cost_eur_nanos: 1_250_000_000,
+          usage: usage(200),
+          turns: 2,
+          last_completed_at: '2026-08-20T11:30:00.000Z',
+        },
+      ],
+      seven_days: [
+        {
+          label: 'Task <img src=x onerror=alert(1)>',
+          key: 'safe-local-key',
+          cost_eur_nanos: 6_500_000_000,
+          usage: usage(700),
+          turns: 7,
+          last_completed_at: '2026-08-20T11:30:00.000Z',
+        },
+      ],
+      month: [
+        {
+          label: 'Task <img src=x onerror=alert(1)>',
+          key: 'safe-local-key',
+          cost_eur_nanos: 8_500_000_000,
+          usage: usage(800),
+          turns: 8,
+          last_completed_at: '2026-08-20T11:30:00.000Z',
+        },
+      ],
+    },
     by_agent: {
       root: {
         cost_eur_nanos: 6_000_000_000,
@@ -149,6 +183,7 @@ function snapshot(settings) {
     recent_turns: [
       {
         completed_at: '2026-08-20T11:30:00.000Z',
+        task_key: 'safe-local-key',
         task_label: 'Task <unsafe>',
         turn_label: 'Turn 1234',
         model: 'gpt-5.6-sol',
@@ -211,6 +246,11 @@ function mockRuntimeData(initialSettings = DEFAULT_SETTINGS) {
     },
     formatEuroCost(value) {
       return `€${Number(value).toFixed(2)}`;
+    },
+    safeTaskKey(value) {
+      return value === 'private-thread-id'
+        ? 'safe-local-key'
+        : `safe-${String(value).length}`;
     },
   };
 }
@@ -292,6 +332,57 @@ function request(server, options = {}) {
   });
 }
 
+function openEventStream(server) {
+  const address = server.address();
+  return new Promise((resolve, reject) => {
+    const outgoing = http.get(
+      {
+        host: '127.0.0.1',
+        port: address.port,
+        path: '/api/events',
+      },
+      (response) => {
+        let body = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk) => {
+          body += chunk;
+          if (body.includes('\n\n') && body.includes('event: dashboard')) {
+            resolve({
+              outgoing,
+              response,
+              get body() {
+                return body;
+              },
+            });
+          }
+        });
+        response.on('error', reject);
+      },
+    );
+    outgoing.on('error', reject);
+  });
+}
+
+async function waitForCondition(predicate, timeoutMs = 1_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) {
+      throw new Error('Timed out waiting for dashboard event data.');
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function dashboardEvents(body) {
+  return body
+    .split('\n\n')
+    .map((block) => block
+      .split('\n')
+      .find((line) => line.startsWith('data: ')))
+    .filter(Boolean)
+    .map((line) => JSON.parse(line.slice('data: '.length)));
+}
+
 test('serves the fixed local dashboard routes with security headers', async (t) => {
   const fixture = await startServer();
   t.after(() => stopServer(fixture.server));
@@ -336,6 +427,110 @@ test('returns server-computed dashboard data and a per-process CSRF token', asyn
     'Task <img src=x onerror=alert(1)>',
   );
   assert.equal(response.json.settings.timezone, 'Europe/Berlin');
+  assert.equal(response.json.live.stale, false);
+  assert.equal(response.json.live.error, false);
+});
+
+test('reuses cached data until a forced refresh is requested', async (t) => {
+  const runtimeData = mockRuntimeData();
+  const originalBuildSnapshot = runtimeData.buildSnapshot;
+  let builds = 0;
+  runtimeData.buildSnapshot = (...arguments_) => {
+    builds += 1;
+    return originalBuildSnapshot(...arguments_);
+  };
+  const fixture = await startServer(runtimeData);
+  t.after(() => stopServer(fixture.server));
+
+  assert.equal((await request(fixture.server, {
+    path: '/api/dashboard',
+  })).statusCode, 200);
+  assert.equal((await request(fixture.server, {
+    path: '/api/dashboard',
+  })).statusCode, 200);
+  assert.equal(builds, 1);
+
+  assert.equal((await request(fixture.server, {
+    path: '/api/dashboard?refresh=1',
+  })).statusCode, 200);
+  assert.equal(builds, 2);
+});
+
+test('joins friendly task names only in the localhost dashboard payload', async (t) => {
+  const codexHome = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'cost-dashboard-codex-home-'),
+  );
+  fs.writeFileSync(
+    path.join(codexHome, 'session_index.jsonl'),
+    `${JSON.stringify({
+      id: 'private-thread-id',
+      thread_name: 'Friendly dashboard task',
+      updated_at: '2026-08-20T11:35:00.000Z',
+    })}\n`,
+    'utf8',
+  );
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cost-dashboard-'));
+  const server = createDashboardServer({
+    dataDir,
+    codexHome,
+    env: {},
+    runtimeData: mockRuntimeData(),
+    nowMs: Date.parse('2026-08-20T12:00:00.000Z'),
+    csrfToken: 'friendly-name-token',
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => stopServer(server));
+
+  const response = await request(server, { path: '/api/dashboard' });
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.json.by_session[0].display_label, 'Friendly dashboard task');
+  assert.equal(
+    response.json.task_scopes.today[0].display_label,
+    'Friendly dashboard task',
+  );
+  assert.equal(
+    response.json.recent_turns[0].display_task_label,
+    'Friendly dashboard task',
+  );
+  assert.equal(response.json.task_names.available, true);
+  assert.equal(response.json.task_names.resolved, 1);
+  assert.equal(
+    response.json.by_session[0].label,
+    'Task <img src=x onerror=alert(1)>',
+  );
+  assert.doesNotMatch(response.body, /private-thread-id/);
+});
+
+test('serves a bounded same-origin event stream for live revisions', async (t) => {
+  const fixture = await startServer();
+  t.after(() => stopServer(fixture.server));
+  const stream = await openEventStream(fixture.server);
+  t.after(() => stream.response.destroy());
+
+  assert.equal(stream.response.statusCode, 200);
+  assert.match(
+    stream.response.headers['content-type'],
+    /^text\/event-stream/,
+  );
+  assert.match(stream.body, /event: dashboard/);
+  assert.match(stream.body, /"type":"current"/);
+  assert.match(stream.body, /"payload_revision":0/);
+
+  const refreshed = await request(fixture.server, {
+    path: '/api/dashboard?refresh=1',
+  });
+  assert.equal(refreshed.statusCode, 200);
+  await waitForCondition(
+    () => dashboardEvents(stream.body).some((event) => event.type === 'updated'),
+  );
+  const updated = dashboardEvents(stream.body)
+    .findLast((event) => event.type === 'updated');
+  assert.equal(updated.stale, false);
+  assert.equal(updated.refreshing, false);
+  assert.ok(updated.payload_revision > 0);
 });
 
 test('omits every accounting total when the ledger snapshot is incomplete', async (t) => {
@@ -385,6 +580,38 @@ test('omits every accounting total when the ledger snapshot is incomplete', asyn
     assert.equal(Object.hasOwn(response.json, field), false, field);
   }
   assert.doesNotMatch(response.body, /partial-secret-model|987654321/);
+});
+
+test('serves trustworthy incomplete accounting as a labeled lower bound', async (t) => {
+  const runtimeData = mockRuntimeData();
+  runtimeData.buildSnapshot = (_dataRoot, options) => ({
+    ...snapshot(options.settings),
+    complete: false,
+    lower_bound: {
+      available: true,
+      pending_turns: 2,
+      known_pending_turns: 1,
+      unknown_pending_turns: 1,
+      today_pending_turns: 1,
+      seven_day_pending_turns: 2,
+      month_pending_turns: 2,
+    },
+    diagnostics: ['Accounting is incomplete for 2 completed turns.'],
+  });
+  const fixture = await startServer(runtimeData);
+  t.after(() => stopServer(fixture.server));
+
+  const response = await request(fixture.server, {
+    path: '/api/dashboard',
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.json.complete, false);
+  assert.equal(response.json.lower_bound.available, true);
+  assert.equal(response.json.lower_bound.pending_turns, 2);
+  assert.equal(response.json.today.display_cost, '€1.25');
+  assert.equal(response.json.by_model[0].model, 'gpt-5.6-sol');
+  assert.match(response.body, /Accounting is incomplete/);
 });
 
 test('uses --data-dir as the real runtime-data root', async (t) => {
@@ -612,6 +839,13 @@ test('uses a fixed route allowlist and never serves traversal paths', async (t) 
   });
   assert.equal(method.statusCode, 405);
   assert.equal(method.headers.allow, 'GET');
+
+  const eventMethod = await request(fixture.server, {
+    method: 'POST',
+    path: '/api/events',
+  });
+  assert.equal(eventMethod.statusCode, 405);
+  assert.equal(eventMethod.headers.allow, 'GET');
 });
 
 test('browser code uses safe DOM sinks for ledger-derived values', () => {
@@ -622,7 +856,8 @@ test('browser code uses safe DOM sinks for ledger-derived values', () => {
   );
   assert.doesNotMatch(source, /fetch\(\s*['"]https?:/);
   assert.match(source, /\.textContent\s*=/);
-  assert.match(source, /if \(data\.complete === false\)/);
+  assert.match(source, /if \(data\.complete === false && !lowerBound\)/);
+  assert.match(source, /Showing a known minimum/);
   assert.match(source, /no partial totals are shown/);
   assert.match(source, /function localDateTime\(value, timeZone\)/);
   assert.match(
@@ -632,4 +867,42 @@ test('browser code uses safe DOM sinks for ledger-derived values', () => {
   assert.match(source, /function optionalPercentage\(value\)/);
   assert.match(source, /Saved with adjustments:/);
   assert.match(source, /fillSettingsForm\(currentSettings\)/);
+  assert.match(source, /new EventSource\(['"]\/api\/events['"]\)/);
+  assert.match(
+    source,
+    /addEventListener\(['"]dashboard['"], scheduleLiveReload\)/,
+  );
+  assert.match(source, /['"]\/api\/dashboard\?refresh=1['"]/);
+  assert.match(
+    source,
+    /if \(options\.source === ['"]live['"]\) \{\s*pendingRevision = ['"]['"];/,
+  );
+});
+
+test('a failed live reload does not suppress retrying the same revision', async () => {
+  const source = fs.readFileSync(path.join(dashboardRoot, 'app.js'), 'utf8');
+  const loadStart = source.indexOf('async function loadDashboard(options = {})');
+  const loadEnd = source.indexOf('\nasync function saveSettings', loadStart);
+  assert.ok(loadStart >= 0 && loadEnd > loadStart);
+  const loadFunction = source.slice(loadStart, loadEnd);
+  const result = await vm.runInNewContext(
+    `
+      let dashboardRequest = null;
+      let dashboardReloadQueued = false;
+      let dashboardReloadForce = false;
+      let liveEvents = null;
+      let pendingRevision = 'payload-7';
+      const elements = { refreshButton: { disabled: false } };
+      const fetch = async () => { throw new Error('temporary failure'); };
+      const setStatus = () => {};
+      const setLiveStatus = () => {};
+      const renderDashboard = () => {};
+      ${loadFunction}
+      loadDashboard({ quiet: true, source: 'live' })
+        .then(() => pendingRevision);
+    `,
+    { queueMicrotask },
+  );
+
+  assert.equal(result, '');
 });

@@ -5,7 +5,20 @@ const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
 
+const {
+  loadDashboardTaskNames,
+  parseTaskNameSourceArguments,
+  resolveSessionIndexPath,
+} = require('../lib/dashboard-task-names');
+const {
+  createDashboardFileInvalidator,
+  createDashboardRefreshCoordinator,
+  createStatSignature,
+} = require('../lib/dashboard-live');
+
 const DEFAULT_PORT = 43_117;
+const DEFAULT_LIVE_POLL_INTERVAL_MS = 3_000;
+const MAX_EVENT_CLIENTS = 16;
 const MAX_JSON_BYTES = 16 * 1024;
 const CSRF_HEADER = 'x-codex-csrf-token';
 const DASHBOARD_ROOT = path.resolve(__dirname, '..', 'dashboard');
@@ -274,6 +287,7 @@ function presentBudget(budget, formatEuroCost) {
 function presentSnapshot(snapshot, formatEuroCost) {
   const value = snapshot && typeof snapshot === 'object' ? snapshot : {};
   const budgets = value.budgets ?? {};
+  const taskScopes = value.task_scopes ?? {};
   return {
     ...value,
     today: presentCostGroup(value.today, formatEuroCost),
@@ -296,13 +310,84 @@ function presentSnapshot(snapshot, formatEuroCost) {
     by_session: (value.by_session ?? []).map((group) =>
       presentCostGroup(group, formatEuroCost),
     ),
+    task_scopes: Object.fromEntries(
+      ['today', 'seven_days', 'month'].map((scope) => [
+        scope,
+        (taskScopes[scope] ?? (scope === 'month' ? value.by_session : [])).map(
+          (group) => presentCostGroup(group, formatEuroCost),
+        ),
+      ]),
+    ),
     by_agent: {
       root: presentCostGroup(value.by_agent?.root, formatEuroCost),
       subagent: presentCostGroup(value.by_agent?.subagent, formatEuroCost),
+      unattributed: presentCostGroup(
+        value.by_agent?.unattributed,
+        formatEuroCost,
+      ),
     },
     recent_turns: (value.recent_turns ?? []).map((turn) =>
       presentCostGroup(turn, formatEuroCost),
     ),
+  };
+}
+
+function taskNameOptions(options, dataRoot, runtimeData) {
+  return {
+    dataRoot,
+    env: options.env ?? process.env,
+    codexHome: options.codexHome,
+    sessionIndexPath: options.sessionIndexPath,
+    ...(typeof runtimeData.safeTaskKey === 'function'
+      ? { safeTaskKey: runtimeData.safeTaskKey }
+      : {}),
+  };
+}
+
+function enrichTaskNames(snapshot, taskNames) {
+  const names = taskNames.names ?? new Map();
+  const resolved = new Set();
+  const enrichGroup = (group) => {
+    const friendlyName = names.get(group.key);
+    if (friendlyName) {
+      resolved.add(group.key);
+    }
+    return {
+      ...group,
+      display_label: friendlyName ?? group.label,
+      has_friendly_name: Boolean(friendlyName),
+    };
+  };
+  const enrichTurn = (turn) => {
+    const friendlyName = names.get(turn.task_key);
+    if (friendlyName) {
+      resolved.add(turn.task_key);
+    }
+    return {
+      ...turn,
+      display_task_label: friendlyName ?? turn.task_label,
+      has_friendly_name: Boolean(friendlyName),
+    };
+  };
+  const taskScopes = Object.fromEntries(
+    Object.entries(snapshot.task_scopes ?? {}).map(([scope, groups]) => [
+      scope,
+      groups.map(enrichGroup),
+    ]),
+  );
+  return {
+    ...snapshot,
+    by_session: (snapshot.by_session ?? []).map(enrichGroup),
+    task_scopes: taskScopes,
+    recent_turns: (snapshot.recent_turns ?? []).map(enrichTurn),
+    task_names: {
+      available: taskNames.available === true,
+      resolved: resolved.size,
+    },
+    diagnostics: [
+      ...(snapshot.diagnostics ?? []),
+      ...(taskNames.available === true ? taskNames.diagnostics ?? [] : []),
+    ],
   };
 }
 
@@ -314,6 +399,83 @@ function publicSettingsResult(result) {
     supported: result.supported !== false,
     ...(result.saved === undefined ? {} : { saved: Boolean(result.saved) }),
     ...(result.reason ? { reason: result.reason } : {}),
+  };
+}
+
+function usageMonthDirectories(dataRoot) {
+  const usageRoot = path.join(dataRoot, 'usage');
+  try {
+    return fs
+      .readdirSync(usageRoot, { withFileTypes: true })
+      .filter(
+        (entry) => entry.isDirectory() && /^\d{4}-\d{2}$/.test(entry.name),
+      )
+      .map((entry) => path.join(usageRoot, entry.name))
+      .sort();
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return [];
+    }
+    throw error;
+  }
+}
+
+function dashboardWatchDirectories(
+  dataRoot,
+  monthDirectories = usageMonthDirectories(dataRoot),
+) {
+  const roots = [dataRoot, path.join(dataRoot, 'usage')].filter((directory) => {
+    try {
+      return fs.statSync(directory).isDirectory();
+    } catch {
+      return false;
+    }
+  });
+  return [...roots, ...monthDirectories];
+}
+
+function dashboardSignaturePaths(
+  dataRoot,
+  sessionIndexPath,
+  monthDirectories = usageMonthDirectories(dataRoot),
+) {
+  const usageRoot = path.join(dataRoot, 'usage');
+  return [
+    path.join(dataRoot, 'settings.json'),
+    usageRoot,
+    ...monthDirectories.flatMap((directory) => [
+      path.join(directory, '.generation'),
+      path.join(directory, 'turns.jsonl'),
+    ]),
+    ...(sessionIndexPath ? [sessionIndexPath] : []),
+  ];
+}
+
+function dashboardWatchEventRelevant(dataRoot, directory, filename) {
+  if (filename === null || filename === undefined) {
+    return true;
+  }
+  const name = Buffer.isBuffer(filename)
+    ? filename.toString('utf8')
+    : String(filename);
+  const usageRoot = path.join(dataRoot, 'usage');
+  if (directory === dataRoot) {
+    return name === 'settings.json' || name === 'usage';
+  }
+  if (directory === usageRoot) {
+    return /^\d{4}-\d{2}$/.test(name);
+  }
+  return name === '.generation' || name === 'turns.jsonl';
+}
+
+function publicLiveState(state) {
+  return {
+    revision: state.revision,
+    payload_revision: state.payloadRevision,
+    stale: state.stale,
+    refreshing:
+      state.dirty || (state.building && state.type !== 'updated'),
+    error: Boolean(state.error),
   };
 }
 
@@ -337,6 +499,9 @@ function createDashboardServer(options = {}) {
       },
     ]),
   );
+  const taskNamesOptions = taskNameOptions(options, dataRoot, runtimeData);
+  const sessionIndexPath = resolveSessionIndexPath(taskNamesOptions);
+  const eventResponses = new Set();
 
   let server;
 
@@ -355,7 +520,10 @@ function createDashboardServer(options = {}) {
       settings_diagnostics: settingsResult.diagnostics ?? [],
       settings_supported: settingsResult.supported !== false,
     };
-    if (snapshot.complete === false) {
+    if (
+      snapshot.complete === false &&
+      snapshot.lower_bound?.available !== true
+    ) {
       return {
         schema: snapshot.schema,
         generated_at: snapshot.generated_at,
@@ -365,10 +533,113 @@ function createDashboardServer(options = {}) {
         ...settingsPayload,
       };
     }
+    const taskNames = loadDashboardTaskNames(
+      taskNamesOptions,
+    );
     return {
-      ...presentSnapshot(snapshot, runtimeData.formatEuroCost),
+      ...enrichTaskNames(
+        presentSnapshot(snapshot, runtimeData.formatEuroCost),
+        taskNames,
+      ),
       ...settingsPayload,
     };
+  }
+
+  const refreshCoordinator = createDashboardRefreshCoordinator({
+    build: loadDashboard,
+    debounceMs: options.refreshDebounceMs,
+    onBuildError(error) {
+      if (options.debug) {
+        process.stderr.write(`dashboard refresh: ${error.message}\n`);
+      }
+    },
+  });
+  let liveMonthDirectories = [];
+  const fileInvalidator = createDashboardFileInvalidator({
+    invalidate: (reason) => refreshCoordinator.invalidate(reason),
+    directories: () => {
+      liveMonthDirectories = usageMonthDirectories(dataRoot);
+      return dashboardWatchDirectories(dataRoot, liveMonthDirectories);
+    },
+    signature: createStatSignature(() =>
+      dashboardSignaturePaths(
+        dataRoot,
+        sessionIndexPath,
+        liveMonthDirectories,
+      ),
+    ),
+    watch(directory, watchOptions, listener) {
+      return fs.watch(directory, watchOptions, (eventType, filename) => {
+        if (dashboardWatchEventRelevant(dataRoot, directory, filename)) {
+          listener(eventType, filename);
+        }
+      });
+    },
+    pollIntervalMs:
+      options.pollIntervalMs ?? DEFAULT_LIVE_POLL_INTERVAL_MS,
+    onError(error, context) {
+      if (options.debug) {
+        process.stderr.write(
+          `dashboard ${context.operation}: ${error.message}\n`,
+        );
+      }
+    },
+  });
+
+  async function dashboardPayload(force = false, reason = 'request') {
+    const state = await refreshCoordinator.refresh({ force, reason });
+    if (!state.hasPayload) {
+      throw new Error('No dashboard snapshot is available.', {
+        cause: state.error ?? undefined,
+      });
+    }
+    return {
+      ...state.payload,
+      live: publicLiveState(state),
+    };
+  }
+
+  function openEventStream(response) {
+    if (eventResponses.size >= MAX_EVENT_CLIENTS) {
+      sendJson(response, 503, { error: 'Too many dashboard event clients.' });
+      return;
+    }
+    setSecurityHeaders(response, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    response.statusCode = 200;
+    response.flushHeaders();
+    response.write('retry: 3000\n\n');
+
+    eventResponses.add(response);
+    const releaseInvalidator = fileInvalidator.retainClient();
+    const unsubscribe = refreshCoordinator.subscribe((event) => {
+      if (response.destroyed || response.writableEnded) {
+        return;
+      }
+      const payload = {
+        type: event.type,
+        reasons: event.reasons,
+        ...publicLiveState(event),
+      };
+      response.write(
+        `id: ${event.revision}\nevent: dashboard\ndata: ${JSON.stringify(payload)}\n\n`,
+      );
+    });
+    let closed = false;
+    const close = () => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      eventResponses.delete(response);
+      unsubscribe();
+      releaseInvalidator();
+    };
+    response.once('close', close);
+    response.once('error', close);
   }
 
   async function handleRequest(request, response) {
@@ -377,7 +648,14 @@ function createDashboardServer(options = {}) {
       return;
     }
 
-    const rawPath = (request.url ?? '').split(/[?#]/, 1)[0];
+    let requestUrl;
+    try {
+      requestUrl = new URL(request.url ?? '/', 'http://127.0.0.1');
+    } catch {
+      sendJson(response, 400, { error: 'Malformed request URL.' });
+      return;
+    }
+    const rawPath = requestUrl.pathname;
 
     if (request.method === 'GET' && rawPath === '/healthz') {
       sendJson(response, 200, { ok: true });
@@ -392,7 +670,8 @@ function createDashboardServer(options = {}) {
 
     if (request.method === 'GET' && rawPath === '/api/dashboard') {
       try {
-        sendJson(response, 200, loadDashboard(), {
+        const force = requestUrl.searchParams.get('refresh') === '1';
+        sendJson(response, 200, await dashboardPayload(force), {
           'X-Codex-CSRF-Token': csrfToken,
         });
       } catch (error) {
@@ -401,6 +680,11 @@ function createDashboardServer(options = {}) {
           detail: options.debug ? error.message : undefined,
         });
       }
+      return;
+    }
+
+    if (request.method === 'GET' && rawPath === '/api/events') {
+      openEventStream(response);
       return;
     }
 
@@ -441,6 +725,7 @@ function createDashboardServer(options = {}) {
           sendJson(response, 409, publicSettingsResult(result));
           return;
         }
+        void refreshCoordinator.invalidate('settings');
         sendJson(response, 200, publicSettingsResult(result));
       } catch (error) {
         sendJson(response, error.statusCode ?? 500, {
@@ -457,6 +742,7 @@ function createDashboardServer(options = {}) {
     const knownPath =
       rawPath === '/healthz' ||
       rawPath === '/api/dashboard' ||
+      rawPath === '/api/events' ||
       rawPath === '/api/settings' ||
       assets.has(rawPath);
     if (knownPath) {
@@ -485,24 +771,46 @@ function createDashboardServer(options = {}) {
       }
     });
   });
-  server.dashboard = Object.freeze({ dataRoot, csrfToken });
+  const nativeClose = server.close.bind(server);
+  let liveClosed = false;
+  server.close = function closeDashboardServer(callback) {
+    if (!liveClosed) {
+      liveClosed = true;
+      fileInvalidator.close();
+      refreshCoordinator.close();
+      for (const response of eventResponses) {
+        response.end();
+      }
+      eventResponses.clear();
+    }
+    return nativeClose(callback);
+  };
+  server.dashboard = Object.freeze({
+    dataRoot,
+    csrfToken,
+    sessionIndexPath,
+    refreshCoordinator,
+    fileInvalidator,
+  });
   return server;
 }
 
 function parseArguments(argv) {
+  const taskNameArguments = parseTaskNameSourceArguments(argv);
   const options = {
     port: DEFAULT_PORT,
     dataDir: undefined,
+    ...taskNameArguments.options,
   };
 
-  for (let index = 0; index < argv.length; index += 1) {
-    const argument = argv[index];
+  for (let index = 0; index < taskNameArguments.remaining.length; index += 1) {
+    const argument = taskNameArguments.remaining[index];
     if (argument === '--help' || argument === '-h') {
       options.help = true;
       continue;
     }
     if (argument === '--port') {
-      const value = argv[index + 1];
+      const value = taskNameArguments.remaining[index + 1];
       index += 1;
       if (!/^\d+$/.test(value ?? '')) {
         throw new Error('--port requires an integer.');
@@ -514,7 +822,7 @@ function parseArguments(argv) {
       continue;
     }
     if (argument === '--data-dir') {
-      const value = argv[index + 1];
+      const value = taskNameArguments.remaining[index + 1];
       index += 1;
       if (!value) {
         throw new Error('--data-dir requires a path.');
@@ -540,7 +848,11 @@ function main(argv = process.argv.slice(2)) {
 
   if (options.help) {
     process.stdout.write(
-      'Usage: node dashboard.js [--port 43117] [--data-dir PATH]\n',
+      [
+        'Usage: node dashboard.js [--port 43117] [--data-dir PATH]',
+        '                         [--codex-home PATH | --session-index PATH]',
+        '',
+      ].join('\n'),
     );
     return null;
   }
@@ -554,6 +866,7 @@ function main(argv = process.argv.slice(2)) {
         [
           `Codex Cost Meter dashboard: http://127.0.0.1:${address.port}/`,
           `Data directory: ${server.dashboard.dataRoot}`,
+          `Task names: ${server.dashboard.sessionIndexPath ?? 'hashed labels only'}`,
           '',
         ].join('\n'),
       );

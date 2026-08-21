@@ -477,6 +477,52 @@ test('a later exact record resolves a gap without rewriting history', (t) => {
   assert.equal(redundant.conflict, false);
 });
 
+test('dashboard snapshots include known gap amounts as a labeled lower bound', (t) => {
+  const dataRoot = temporaryData(t);
+  runtime.appendLedgerRecord(dataRoot, ledgerRecord());
+  runtime.appendLedgerGap(
+    dataRoot,
+    ledgerGap({
+      turn_id: 'known-gap',
+      known_usage: usage(50),
+      known_cost_usd_nanos: 400_000_000,
+      known_cost_eur_nanos: 300_000_000,
+    }),
+  );
+  runtime.appendLedgerGap(
+    dataRoot,
+    ledgerGap({
+      turn_id: 'unknown-gap',
+      reason: 'usage_unavailable',
+    }),
+  );
+
+  const snapshot = runtime.buildSnapshot(dataRoot, {
+    now: '2026-08-20T13:00:00.000Z',
+  });
+
+  assert.equal(snapshot.complete, false);
+  assert.deepEqual(snapshot.lower_bound, {
+    available: true,
+    pending_turns: 2,
+    known_pending_turns: 1,
+    unknown_pending_turns: 1,
+    today_pending_turns: 2,
+    seven_day_pending_turns: 2,
+    month_pending_turns: 2,
+  });
+  assert.equal(snapshot.today.cost_eur_nanos, 1_200_000_000);
+  assert.equal(snapshot.today.turns, 2);
+  assert.equal(snapshot.by_agent.root.cost_eur_nanos, 900_000_000);
+  assert.equal(snapshot.by_agent.unattributed.cost_eur_nanos, 300_000_000);
+  assert.equal(snapshot.by_agent.unattributed.turns, 1);
+  assert.equal(
+    snapshot.by_model.find((group) => group.model === 'unknown')
+      ?.cost_eur_nanos,
+    300_000_000,
+  );
+});
+
 test('resolves a gap by turn identity when completion timestamp changes', (t) => {
   const dataRoot = temporaryData(t);
   const gap = ledgerGap({
@@ -949,6 +995,23 @@ test('summarizes models, sessions, agents, cache usage, and recent turns', (t) =
   );
   assert.equal(snapshot.by_session.length, 1);
   assert.equal(snapshot.by_session[0].cost_eur_nanos, 3_000_000_000);
+  assert.equal(
+    snapshot.by_session[0].last_completed_at,
+    '2026-08-20T10:00:00.000Z',
+  );
+  assert.deepEqual(
+    Object.fromEntries(
+      Object.entries(snapshot.task_scopes).map(([scope, groups]) => [
+        scope,
+        groups.map((group) => group.cost_eur_nanos),
+      ]),
+    ),
+    {
+      today: [3_000_000_000],
+      seven_days: [3_000_000_000],
+      month: [3_000_000_000],
+    },
+  );
   assert.doesNotMatch(JSON.stringify(snapshot), /private|project-name/);
   assert.equal(snapshot.by_agent.root.cost_eur_nanos, 2_400_000_000);
   assert.equal(snapshot.by_agent.subagent.cost_eur_nanos, 600_000_000);
@@ -969,6 +1032,7 @@ test('summarizes models, sessions, agents, cache usage, and recent turns', (t) =
   assert.ok(Math.abs(snapshot.cache.hit_rate_percent - 100 / 3) < 1e-12);
   assert.equal(snapshot.recent_turns.length, 2);
   assert.equal(snapshot.recent_turns[0].model, 'model-a');
+  assert.match(snapshot.recent_turns[0].task_key, /^[a-f0-9]{16}$/);
   assert.equal(snapshot.records_count, 2);
   assert.equal(snapshot.conflicts.length, 0);
   assert.deepEqual(snapshot.diagnostics, []);

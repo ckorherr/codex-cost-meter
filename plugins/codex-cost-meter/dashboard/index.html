@@ -11,25 +11,23 @@
   <body>
     <header class="site-header">
       <div>
-        <div class="eyebrow">
-          <span class="status-dot" aria-hidden="true"></span>
-          Local only
-        </div>
-        <h1>Codex Cost Meter</h1>
+        <h1>Codex cost meter</h1>
         <p class="subtitle">
-          Spending guidance from your local accounting ledger.
+          Local ledger · <span id="timezone">Europe/Berlin</span> ·
+          <span id="refreshed">Waiting for data</span>
         </p>
       </div>
       <div class="header-actions">
         <p class="refresh-meta">
-          <span id="timezone">Europe/Berlin</span>
-          <span aria-hidden="true">·</span>
-          <span id="refreshed">Waiting for data</span>
+          <span id="live-status" class="live-status" data-state="connecting">
+            <span class="live-dot" aria-hidden="true"></span>
+            <span id="live-status-copy">Connecting…</span>
+          </span>
         </p>
-        <button id="refresh-button" class="button secondary" type="button">
+        <button id="refresh-button" class="text-button" type="button">
           Refresh
         </button>
-        <button id="settings-button" class="button" type="button">
+        <button id="settings-button" class="text-button" type="button">
           Settings
         </button>
       </div>
@@ -60,13 +58,27 @@
         </article>
       </section>
 
-      <section class="panel budget-panel" aria-labelledby="budget-heading">
+      <section
+        id="budget-panel"
+        class="panel budget-panel"
+        aria-labelledby="budget-heading"
+      >
         <div class="section-heading">
           <div>
             <p class="eyebrow">Guidance</p>
             <h2 id="budget-heading">Budget progress</h2>
           </div>
-          <p class="section-note">Informational only</p>
+          <div class="budget-heading-actions">
+            <p id="budget-state-note" class="section-note">Informational only</p>
+            <button
+              id="budget-setup-button"
+              class="text-button"
+              type="button"
+              hidden
+            >
+              Set a budget
+            </button>
+          </div>
         </div>
         <div class="budget-grid">
           <div class="budget-item">
@@ -87,6 +99,107 @@
               0%
             </progress>
           </div>
+        </div>
+      </section>
+
+      <section class="panel task-panel" aria-labelledby="tasks-heading">
+        <div class="section-heading task-heading">
+          <div>
+            <p class="eyebrow">Where the spend goes</p>
+            <h2 id="tasks-heading">Cost by task</h2>
+          </div>
+          <p id="task-count" class="section-note">—</p>
+        </div>
+
+        <div class="task-toolbar">
+          <div class="scope-control" role="group" aria-label="Task cost period">
+            <button
+              class="scope-button"
+              type="button"
+              data-task-scope="today"
+              aria-pressed="false"
+            >
+              Today
+            </button>
+            <button
+              class="scope-button"
+              type="button"
+              data-task-scope="seven_days"
+              aria-pressed="false"
+            >
+              7 days
+            </button>
+            <button
+              class="scope-button"
+              type="button"
+              data-task-scope="month"
+              aria-pressed="true"
+            >
+              Month
+            </button>
+          </div>
+
+          <label class="task-search">
+            <span class="visually-hidden">Search tasks</span>
+            <input
+              id="task-search"
+              type="search"
+              placeholder="Search tasks"
+              autocomplete="off"
+            >
+          </label>
+        </div>
+
+        <div class="table-wrap task-table-wrap">
+          <table class="task-table">
+            <thead>
+              <tr>
+                <th scope="col" data-task-sort-column="name">
+                  <button class="sort-button" type="button" data-task-sort="name">
+                    <span>Task</span>
+                    <span class="sort-indicator" aria-hidden="true"></span>
+                  </button>
+                </th>
+                <th scope="col" data-task-sort-column="share">
+                  <button class="sort-button" type="button" data-task-sort="share">
+                    <span>Share</span>
+                    <span class="sort-indicator" aria-hidden="true"></span>
+                  </button>
+                </th>
+                <th scope="col" data-task-sort-column="turns">
+                  <button class="sort-button" type="button" data-task-sort="turns">
+                    <span>Turns</span>
+                    <span class="sort-indicator" aria-hidden="true"></span>
+                  </button>
+                </th>
+                <th scope="col" data-task-sort-column="tokens">
+                  <button class="sort-button" type="button" data-task-sort="tokens">
+                    <span>Tokens</span>
+                    <span class="sort-indicator" aria-hidden="true"></span>
+                  </button>
+                </th>
+                <th scope="col" data-task-sort-column="last_active">
+                  <button class="sort-button" type="button" data-task-sort="last_active">
+                    <span>Last active</span>
+                    <span class="sort-indicator" aria-hidden="true"></span>
+                  </button>
+                </th>
+                <th scope="col" data-task-sort-column="average">
+                  <button class="sort-button" type="button" data-task-sort="average">
+                    <span>Avg / turn</span>
+                    <span class="sort-indicator" aria-hidden="true"></span>
+                  </button>
+                </th>
+                <th scope="col" data-task-sort-column="cost" aria-sort="descending">
+                  <button class="sort-button" type="button" data-task-sort="cost">
+                    <span>Cost</span>
+                    <span class="sort-indicator" aria-hidden="true">↓</span>
+                  </button>
+                </th>
+              </tr>
+            </thead>
+            <tbody id="tasks-body"></tbody>
+          </table>
         </div>
       </section>
 
@@ -119,6 +232,11 @@
               <dd id="subagent-cost">—</dd>
               <dd id="subagent-tokens" class="muted">—</dd>
             </div>
+            <div id="unattributed-agent-row" hidden>
+              <dt>Pending attribution</dt>
+              <dd id="unattributed-agent-cost">—</dd>
+              <dd id="unattributed-agent-tokens" class="muted">—</dd>
+            </div>
           </dl>
         </article>
 
@@ -150,8 +268,8 @@
         </article>
       </section>
 
-      <section class="group-grid">
-        <article class="panel" aria-labelledby="models-heading">
+      <section class="group-grid model-grid">
+        <article class="panel model-panel" aria-labelledby="models-heading">
           <div class="section-heading">
             <div>
               <p class="eyebrow">Breakdown</p>
@@ -173,27 +291,6 @@
           </div>
         </article>
 
-        <article class="panel" aria-labelledby="sessions-heading">
-          <div class="section-heading">
-            <div>
-              <p class="eyebrow">Breakdown</p>
-              <h2 id="sessions-heading">Cost by task</h2>
-            </div>
-          </div>
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th scope="col">Local task</th>
-                  <th scope="col">Turns</th>
-                  <th scope="col">Tokens</th>
-                  <th scope="col">Cost</th>
-                </tr>
-              </thead>
-              <tbody id="sessions-body"></tbody>
-            </table>
-          </div>
-        </article>
       </section>
 
       <section class="panel" aria-labelledby="recent-heading">
@@ -202,7 +299,17 @@
             <p class="eyebrow">Ledger</p>
             <h2 id="recent-heading">Recent turns</h2>
           </div>
-          <p id="ledger-count" class="section-note">—</p>
+          <div class="recent-heading-actions">
+            <p id="ledger-count" class="section-note">—</p>
+            <button
+              id="recent-toggle"
+              class="text-button"
+              type="button"
+              hidden
+            >
+              Show more
+            </button>
+          </div>
         </div>
         <div class="table-wrap">
           <table>
@@ -210,7 +317,6 @@
               <tr>
                 <th scope="col">Completed</th>
                 <th scope="col">Task</th>
-                <th scope="col">Turn</th>
                 <th scope="col">Model</th>
                 <th scope="col">Agents</th>
                 <th scope="col">Tokens</th>
